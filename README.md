@@ -33,8 +33,8 @@ Three components run in a single process, communicating over localhost HTTP:
 
 ### Generator (`internal/generator`)
 - Produces `HASHES_PER_BLOCK` random 32-byte hashes (mock txids).
-- Submits them at a rate of `HASHES_PER_BLOCK / 600` per second so the full block is generated over 10 minutes.
-- Each submission randomly picks one of 100 callback tokens, simulating 100 distinct submitting businesses.
+- Submits them at a rate of `HASHES_PER_BLOCK / duration` per second.
+- Each submission picks one of 100 callback tokens round-robin, simulating 100 distinct submitting businesses.
 
 ### Merkle Service (`internal/merkleservice`)
 - Receives `POST /watch` with `{ txid, callback: { url, token } }`.
@@ -42,9 +42,10 @@ Three components run in a single process, communicating over localhost HTTP:
   - Builds 3 miners' versions of the subtree with deterministically jittered ordering (miner 0 = canonical, miner 1 = 5 % adjacent swaps, miner 2 = 10 %).
   - Pre-computes miner-0 merkle proofs for every token that has txids in the subtree.
 - When `HASHES_PER_BLOCK` txids are received, **finalises the block**:
-  - Builds the top tree from the 60 subtree roots (one call to `GetAllProofs`).
+  - Builds the top tree from all subtree roots (one call to `GetAllProofs`).
   - For each of the 100 tokens, combines all pre-computed subtree proofs with the top-tree legs into a single compound `MerklePath` using go-sdk's `Combine`.
   - POSTs the raw BUMP binary to each token's callback URL.
+  - Signals the main process to exit cleanly.
 
 ### Callback Server (`internal/callback`)
 - Receives the raw BUMP binary POSTs.
@@ -60,13 +61,13 @@ Three components run in a single process, communicating over localhost HTTP:
 
 | Parameter | Default | Notes |
 |-----------|---------|-------|
-| `HASHES_PER_BLOCK` | 61 440 | 60 subtrees × 1 024 |
-| `HASHES_PER_SUBTREE` | 1 024 | subtree height = 10 |
-| Subtrees per block | 60 | top tree height = 6 |
-| Block merkle height | 16 | 10 + 6 |
+| `HASHES_PER_BLOCK` | 1 024 | 16 subtrees × 64 |
+| `HASHES_PER_SUBTREE` | 64 | subtree height = 6 |
+| Subtrees per block | 16 | top tree height = 4 |
+| Block merkle height | 10 | 6 + 4 |
 | Num miners | 3 | competing subtree orderings |
 | Num businesses | 100 | distinct callback tokens |
-| Test duration | 10 min | ≈ 102.4 txids/sec |
+| Test duration | 10 s | ≈ 102.4 txids/sec |
 | Mock block height | 800 000 | stamped in every BUMP |
 
 ---
@@ -74,7 +75,7 @@ Three components run in a single process, communicating over localhost HTTP:
 ## Prerequisites
 
 - Go 1.24 or later (`go version`)
-- Ports **:8080** (merkle service) and **:3000** (callback server) available
+- Ports **:18080** (merkle service) and **:13000** (callback server) available
 
 ---
 
@@ -88,54 +89,56 @@ cd stumpt
 go build -o harness ./cmd/harness/
 ```
 
-### 2. Run with default parameters (10-minute full test)
+### 2. Run with default parameters (~10 seconds)
 
 ```bash
 ./harness
 ```
 
-The harness starts both servers, then the generator.  Structured JSON logs stream to stdout.  When all txids have been submitted and all BUMPs delivered, a summary table is printed:
+The harness starts both servers, then the generator.  Structured JSON logs stream to stdout.  When all txids have been submitted and all BUMPs delivered, a summary table is printed and the process exits:
 
 ```
 ╔══════════════════════════════════════════╗
 ║          STUMPT FINAL SUMMARY            ║
 ╠══════════════════════════════════════════╣
-║  Elapsed:                       10m0.3s  ║
-║  Txids submitted:               61440    ║
-║  Actual rate:                  102.4/s   ║
+║  Elapsed:                        10.183s ║
+║  Txids submitted:                   1024 ║
+║  Actual rate:                   102.4/s  ║
 ╠══════════════════════════════════════════╣
-║  Subtrees sealed:                   60   ║
-║  Avg seal time:                  8.50ms  ║
-║  Proof pre-computations:            60   ║
-║  Avg proof time:                45.00ms  ║
+║  Subtrees sealed:                    16  ║
+║  Avg seal time:                  0.08ms  ║
+║  Proof pre-computations:             16  ║
+║  Avg proof time:                 0.05ms  ║
 ╠══════════════════════════════════════════╣
-║  Top tree build:                 1.00ms  ║
-║  BUMP assembly (100tok):       250.00ms  ║
-║  Callbacks delivered:              100   ║
-║  Avg callback time:              5.00ms  ║
-║  Avg BUMP size:                8000 B    ║
-║  Total BUMP bytes:            800000 B   ║
+║  Top tree build:                 0.00ms  ║
+║  BUMP assembly (100tok):         1.46ms  ║
+║  Callbacks delivered:               200  ║
+║  Avg callback time:              5.22ms  ║
+║  Avg BUMP size:                   759 B  ║
+║  Total BUMP bytes:             151880 B  ║
 ╚══════════════════════════════════════════╝
 ```
 
-### 3. Quick smoke test (completes in ~10 seconds)
+### 3. Full-scale test (10-minute block simulation)
 
 ```bash
 ./harness \
-  -hashes-per-block 1024 \
-  -hashes-per-subtree 64
+  -hashes-per-block 61440 \
+  -hashes-per-subtree 1024 \
+  -duration 10m
 ```
 
-This runs 1 024 txids at 1.7 txids/sec across 16 subtrees and exercises the full pipeline in about 10 seconds.
+This runs 61 440 txids (60 subtrees × 1 024) at ~102.4 txids/sec over 10 minutes, matching a real Teranode block interval.
 
 ### 4. All CLI flags
 
 ```
--hashes-per-block   int    Total txids per simulated block    (default 61440)
--hashes-per-subtree int    Txids per subtree                  (default 1024)
--miners             int    Number of competing miners         (default 3)
--merkle-addr        string Merkle service listen address      (default :8080)
--callback-addr      string Callback server listen address     (default :3000)
+-hashes-per-block   int      Total txids per simulated block    (default 1024)
+-hashes-per-subtree int      Txids per subtree                  (default 64)
+-miners             int      Number of competing miners         (default 3)
+-duration           duration Total test duration                (default 10s)
+-merkle-addr        string   Merkle service listen address      (default :18080)
+-callback-addr      string   Callback server listen address     (default :13000)
 ```
 
 `hashes-per-block` must be divisible by `hashes-per-subtree`.
@@ -148,6 +151,18 @@ The merkle engine has a full unit + integration test suite that verifies proof c
 
 ```bash
 go test ./...
+```
+
+With the race detector:
+
+```bash
+go test -race ./...
+```
+
+Benchmarks:
+
+```bash
+go test -bench=. -benchmem ./internal/subtree/
 ```
 
 Key tests in `internal/subtree/`:
@@ -168,8 +183,8 @@ Key tests in `internal/subtree/`:
 
 The key insight this harness measures is the **work distribution**:
 
-- **During the block interval (10 min):** subtree sealing + proof pre-computation runs continuously. Each subtree seal takes `~seal_time × num_miners` ms and pre-computing proofs takes `~proof_time` ms per subtree. This work is spread over 60 subtree boundaries across 10 minutes.
-- **At block found:** only the top-tree build (`~1 ms` for 60 nodes) and BUMP assembly (`~Xms` for 100 tokens) need to happen before delivery. The pre-computed proofs pay for themselves here.
+- **During the block interval:** subtree sealing + proof pre-computation runs continuously. Each subtree seal takes `~seal_time × num_miners` ms and pre-computing proofs takes `~proof_time` ms per subtree. This work is spread evenly across all subtree boundaries throughout the inter-block interval.
+- **At block found:** only the top-tree build (microseconds for ≤64 subtree roots) and BUMP assembly (~ms for 100 tokens) need to happen before delivery. The pre-computed proofs pay for themselves here.
 - **Per-business BUMP size** reflects how many txids that business submitted. Businesses with more txids get larger but more compact compound BUMPs (intermediate hashes are pruned by `Combine`).
 
 ---

@@ -28,19 +28,19 @@ type Config struct {
 
 // Default returns a Config with the standard test parameters.
 //
-//	HASHES_PER_BLOCK   = 61_440  (60 subtrees × 1024)
-//	HASHES_PER_SUBTREE = 1_024
-//	test duration       = 10 min → ~102.4 txids/sec
+//	HASHES_PER_BLOCK   = 1_024  (16 subtrees × 64)
+//	HASHES_PER_SUBTREE = 64
+//	test duration       = 10 s → ~102.4 txids/sec
 func Default() *Config {
 	return &Config{
-		HashesPerBlock:    61_440,
-		HashesPerSubtree:  1_024,
+		HashesPerBlock:    1_024,
+		HashesPerSubtree:  64,
 		NumMiners:         3,
 		NumBusinesses:     100,
 		MerkleServiceAddr: ":18080",
 		CallbackAddr:      ":13000",
 		BlockHeight:       800_000,
-		TestDuration:      10 * time.Minute,
+		TestDuration:      10 * time.Second,
 		JitterPercent:     []float64{0.0, 0.05, 0.10},
 	}
 }
