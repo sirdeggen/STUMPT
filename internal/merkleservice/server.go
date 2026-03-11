@@ -19,6 +19,7 @@ type Server struct {
 	mc      *metrics.Collector
 	reg     *Registry
 	blockCh chan struct{} // closed once BUMP delivery is complete
+	ctx     context.Context
 }
 
 // NewServer creates a Server, wiring up the Registry.
@@ -28,12 +29,14 @@ func NewServer(cfg *config.Config, mc *metrics.Collector) *Server {
 		mc:      mc,
 		reg:     newRegistry(cfg, mc),
 		blockCh: make(chan struct{}),
+		ctx:     context.Background(),
 	}
 	return s
 }
 
 // Start runs the HTTP server until ctx is cancelled.
 func (s *Server) Start(ctx context.Context) {
+	s.ctx = ctx
 	h := &handler{reg: s.reg, srv: s}
 	srv := &http.Server{
 		Addr:    s.cfg.MerkleServiceAddr,
@@ -70,7 +73,7 @@ func (s *Server) onBlockComplete(evt *BlockFinalizedEvent) {
 	)
 
 	processBUMPs(
-		context.Background(),
+		s.ctx,
 		s.cfg.BlockHeight,
 		s.cfg.SubtreeHeight(),
 		s.cfg.TopTreeHeight(),

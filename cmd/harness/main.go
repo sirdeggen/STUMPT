@@ -2,8 +2,8 @@
 //
 // Runs three components in a single process:
 //
-//  1. Callback server  (:3000) – receives BUMP deliveries from the merkle service.
-//  2. Merkle service   (:8080) – accepts /watch, seals subtrees, assembles BUMPs.
+//  1. Callback server  (:13000) – receives BUMP deliveries from the merkle service.
+//  2. Merkle service   (:18080) – accepts /watch, seals subtrees, assembles BUMPs.
 //  3. Generator              – submits random txids to /watch at a controlled rate.
 //
 // Usage:
@@ -15,8 +15,9 @@
 //	-hashes-per-block   N    default 61440
 //	-hashes-per-subtree N    default 1024  (must divide hashes-per-block)
 //	-miners             N    default 3
-//	-merkle-addr        addr default :8080
-//	-callback-addr      addr default :3000
+//	-duration           dur  default 10m  (controls txid submission rate)
+//	-merkle-addr        addr default :18080
+//	-callback-addr      addr default :13000
 package main
 
 import (
@@ -44,6 +45,8 @@ func main() {
 		"Txids per subtree (must divide hashes-per-block)")
 	flag.IntVar(&cfg.NumMiners, "miners", cfg.NumMiners,
 		"Number of competing miners to simulate")
+	flag.DurationVar(&cfg.TestDuration, "duration", cfg.TestDuration,
+		"Total test duration (controls submission rate)")
 	flag.StringVar(&cfg.MerkleServiceAddr, "merkle-addr", cfg.MerkleServiceAddr,
 		"Merkle service listen address")
 	flag.StringVar(&cfg.CallbackAddr, "callback-addr", cfg.CallbackAddr,
@@ -117,13 +120,20 @@ func main() {
 
 	// ── Run generator (blocks until all txids submitted) ─────────────────────
 	gen := generator.New(cfg, mc)
+
+	// Cancel the main context as soon as the block pipeline finishes so the
+	// generator and all other goroutines exit promptly.
+	go func() {
+		msSrv.WaitForBlock(ctx)
+		cancel()
+	}()
+
 	gen.Run(ctx)
 
 	// ── Wait for block finalization + BUMP delivery ───────────────────────────
+	// (WaitForBlock returns immediately if already done, or waits with main ctx.)
 	slog.Info("generator done; waiting for block pipeline")
-	waitCtx, waitCancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer waitCancel()
-	msSrv.WaitForBlock(waitCtx)
+	msSrv.WaitForBlock(ctx)
 
 	// ── Summary ───────────────────────────────────────────────────────────────
 	mc.PrintSummary()
