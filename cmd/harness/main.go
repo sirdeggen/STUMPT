@@ -35,6 +35,7 @@ import (
 	"github.com/bsv-blockchain/stumpt/internal/generator"
 	"github.com/bsv-blockchain/stumpt/internal/merkleservice"
 	"github.com/bsv-blockchain/stumpt/internal/metrics"
+	"github.com/bsv-blockchain/stumpt/internal/netutil"
 )
 
 func main() {
@@ -111,15 +112,34 @@ func main() {
 		cancel()
 	}()
 
+	// ── Bind listeners (auto-increment port if in use) ───────────────────────
+	cbLn, cbAddr, err := netutil.Listen(cfg.CallbackAddr, 100)
+	if err != nil {
+		slog.Error("callback: bind failed", "err", err)
+		os.Exit(1)
+	}
+	if cbAddr != cfg.CallbackAddr {
+		slog.Info("callback port in use, shifted", "requested", cfg.CallbackAddr, "using", cbAddr)
+	}
+	cfg.CallbackAddr = cbAddr
+
+	msLn, msAddr, err := netutil.Listen(cfg.MerkleServiceAddr, 100)
+	if err != nil {
+		slog.Error("merkle service: bind failed", "err", err)
+		os.Exit(1)
+	}
+	if msAddr != cfg.MerkleServiceAddr {
+		slog.Info("merkle service port in use, shifted", "requested", cfg.MerkleServiceAddr, "using", msAddr)
+	}
+	cfg.MerkleServiceAddr = msAddr
+
 	// ── Start callback server ─────────────────────────────────────────────────
-	cbSrv := callback.NewServer(cfg.CallbackAddr, mc)
+	cbSrv := callback.NewServer(cbLn, mc)
 	go cbSrv.Start(ctx)
-	time.Sleep(80 * time.Millisecond) // give it a moment to bind
 
 	// ── Start merkle service ──────────────────────────────────────────────────
-	msSrv := merkleservice.NewServer(cfg, mc)
+	msSrv := merkleservice.NewServer(cfg, mc, msLn)
 	go msSrv.Start(ctx)
-	time.Sleep(80 * time.Millisecond) // give it a moment to bind
 
 	// ── Run generator (blocks until all txids submitted) ─────────────────────
 	gen := generator.New(cfg, mc)

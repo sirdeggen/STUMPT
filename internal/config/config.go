@@ -1,6 +1,9 @@
 package config
 
-import "time"
+import (
+	"net"
+	"time"
+)
 
 // Config holds all configurable parameters for the STUMPT test harness.
 type Config struct {
@@ -67,7 +70,16 @@ func (c *Config) SubmissionInterval() time.Duration {
 }
 
 // CallbackURL returns the base URL of the callback receiver.
-func (c *Config) CallbackURL() string { return "http://localhost" + c.CallbackAddr }
+// It always uses "localhost" as the host regardless of what the listener
+// bound to (e.g. "0.0.0.0" or "[::]") so the merkle service can reach it.
+func (c *Config) CallbackURL() string {
+	_, port, err := net.SplitHostPort(c.CallbackAddr)
+	if err != nil {
+		// Fallback: treat the whole string as ":port" style.
+		return "http://localhost" + c.CallbackAddr
+	}
+	return "http://localhost:" + port
+}
 
 // log2Ceil returns ⌈log₂(n)⌉ — i.e. the smallest h such that 2^h ≥ n.
 func log2Ceil(n int) int {

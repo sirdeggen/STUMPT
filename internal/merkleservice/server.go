@@ -6,6 +6,7 @@ package merkleservice
 import (
 	"context"
 	"log/slog"
+	"net"
 	"net/http"
 	"time"
 
@@ -18,16 +19,18 @@ type Server struct {
 	cfg     *config.Config
 	mc      *metrics.Collector
 	reg     *Registry
+	ln      net.Listener
 	blockCh chan struct{} // closed once BUMP delivery is complete
 	ctx     context.Context
 }
 
-// NewServer creates a Server, wiring up the Registry.
-func NewServer(cfg *config.Config, mc *metrics.Collector) *Server {
+// NewServer creates a Server bound to ln, wiring up the Registry.
+func NewServer(cfg *config.Config, mc *metrics.Collector, ln net.Listener) *Server {
 	s := &Server{
 		cfg:     cfg,
 		mc:      mc,
 		reg:     newRegistry(cfg, mc),
+		ln:      ln,
 		blockCh: make(chan struct{}),
 		ctx:     context.Background(),
 	}
@@ -38,10 +41,7 @@ func NewServer(cfg *config.Config, mc *metrics.Collector) *Server {
 func (s *Server) Start(ctx context.Context) {
 	s.ctx = ctx
 	h := &handler{reg: s.reg, srv: s}
-	srv := &http.Server{
-		Addr:    s.cfg.MerkleServiceAddr,
-		Handler: h,
-	}
+	srv := &http.Server{Handler: h}
 
 	go func() {
 		<-ctx.Done()
@@ -50,8 +50,8 @@ func (s *Server) Start(ctx context.Context) {
 		_ = srv.Shutdown(shutCtx)
 	}()
 
-	slog.Info("merkle service listening", "addr", s.cfg.MerkleServiceAddr)
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	slog.Info("merkle service listening", "addr", s.ln.Addr())
+	if err := srv.Serve(s.ln); err != nil && err != http.ErrServerClosed {
 		slog.Error("merkle service error", "err", err)
 	}
 }

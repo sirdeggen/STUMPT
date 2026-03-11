@@ -35,10 +35,7 @@ func (s *Server) Start(ctx context.Context) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleBUMP)
 
-	srv := &http.Server{
-		Addr:    s.addr,
-		Handler: mux,
-	}
+	srv := &http.Server{Handler: mux}
 
 	go func() {
 		<-ctx.Done()
@@ -47,8 +44,8 @@ func (s *Server) Start(ctx context.Context) {
 		_ = srv.Shutdown(shutCtx)
 	}()
 
-	slog.Info("callback server listening", "addr", s.addr)
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	slog.Info("callback server listening", "addr", s.ln.Addr())
+	if err := srv.Serve(s.ln); err != nil && err != http.ErrServerClosed {
 		slog.Error("callback server error", "err", err)
 	}
 }
