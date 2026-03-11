@@ -64,6 +64,11 @@ func (s *Server) WaitForBlock(ctx context.Context) {
 	}
 }
 
+// deliveryTimeout is the maximum time allowed for BUMP assembly + delivery
+// after the block is complete.  It is independent of the main run context so
+// that a near-deadline block finalisation still delivers all BUMPs.
+const deliveryTimeout = 2 * time.Minute
+
 // onBlockComplete is called (in a goroutine) by the handler when the block is
 // full.  It drives the BUMP assembly and delivery pipeline.
 func (s *Server) onBlockComplete(evt *BlockFinalizedEvent) {
@@ -72,8 +77,13 @@ func (s *Server) onBlockComplete(evt *BlockFinalizedEvent) {
 		"tokens", len(evt.Callbacks),
 	)
 
+	// Use a fresh context so that a main-context cancellation or timeout
+	// that coincides with block finalisation does not abort BUMP delivery.
+	deliveryCtx, cancel := context.WithTimeout(context.Background(), deliveryTimeout)
+	defer cancel()
+
 	processBUMPs(
-		s.ctx,
+		deliveryCtx,
 		s.cfg.BlockHeight,
 		s.cfg.SubtreeHeight(),
 		s.cfg.TopTreeHeight(),

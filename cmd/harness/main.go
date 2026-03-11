@@ -96,10 +96,15 @@ func main() {
 
 	mc := metrics.NewCollector()
 
-	// Context: test duration + generous buffer for BUMP delivery.
+	// The main context governs HTTP servers and the generator.  We give it
+	// a large ceiling (TestDuration × 2 + 5 min) so that a run which
+	// overshoots its target duration (e.g. OS scheduling jitter at high
+	// submission rates) is not cut off before block finalisation.
+	// BUMP delivery uses its own independent context (see server.go) and is
+	// never subject to this deadline.
 	ctx, cancel := context.WithTimeout(
 		context.Background(),
-		cfg.TestDuration+2*time.Minute,
+		cfg.TestDuration*2+5*time.Minute,
 	)
 	defer cancel()
 
