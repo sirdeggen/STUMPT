@@ -224,6 +224,48 @@ func TestGetAllProofs(t *testing.T) {
 	}
 }
 
+// ── Benchmarks ────────────────────────────────────────────────────────────────
+
+// BenchmarkBuildMerkleStore1024 measures BuildMerkleStore at the default
+// subtree size (1024 leaves = HashesPerSubtree).
+func BenchmarkBuildMerkleStore1024(b *testing.B) {
+	leaves := make([]chainhash.Hash, 1024)
+	for i := range leaves {
+		leaves[i][0] = byte(i)
+		leaves[i][1] = byte(i >> 8)
+	}
+	b.ResetTimer()
+	for range b.N {
+		_ = subtree.BuildMerkleStore(leaves)
+	}
+}
+
+// BenchmarkGetAllProofs1024 measures GetAllProofs at the default subtree size.
+func BenchmarkGetAllProofs1024(b *testing.B) {
+	leaves := make([]chainhash.Hash, 1024)
+	for i := range leaves {
+		leaves[i][0] = byte(i)
+		leaves[i][1] = byte(i >> 8)
+	}
+	b.ResetTimer()
+	for range b.N {
+		_, _ = subtree.GetAllProofs(leaves)
+	}
+}
+
+// BenchmarkBuildMerkleStoreFullBlock measures the top-level tree for a full
+// 61440-txid block (60 subtrees padded to 64, so 64 subtree-roots as leaves).
+func BenchmarkBuildMerkleStoreFullBlock(b *testing.B) {
+	leaves := make([]chainhash.Hash, 64)
+	for i := range leaves {
+		leaves[i][0] = byte(i)
+	}
+	b.ResetTimer()
+	for range b.N {
+		_ = subtree.BuildMerkleStore(leaves)
+	}
+}
+
 // itoa is a minimal int-to-string helper to avoid importing strconv.
 func itoa(n int) string {
 	if n == 0 {
