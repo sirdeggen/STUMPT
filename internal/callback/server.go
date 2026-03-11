@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"time"
 
@@ -15,14 +16,14 @@ import (
 
 // Server is the mock callback receiver.
 type Server struct {
-	addr      string
+	ln        net.Listener
 	mc        *metrics.Collector
 	blockTime time.Time // set by SetBlockTime when the block is announced
 }
 
-// NewServer creates a new callback Server.
-func NewServer(addr string, mc *metrics.Collector) *Server {
-	return &Server{addr: addr, mc: mc}
+// NewServer creates a new callback Server bound to ln.
+func NewServer(ln net.Listener, mc *metrics.Collector) *Server {
+	return &Server{ln: ln, mc: mc}
 }
 
 // SetBlockTime records the instant the block was announced so we can measure

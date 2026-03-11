@@ -74,7 +74,7 @@ func (c *Collector) RecordCallback(d time.Duration, bytes int) {
 }
 
 // PrintSummary writes the final human-readable report to stdout.
-func (c *Collector) PrintSummary() {
+func (c *Collector) PrintSummary(numBusinesses int) {
 	elapsed := time.Since(c.startTime)
 	submitted := c.submitted.Load()
 	actualRate := float64(submitted) / elapsed.Seconds()
@@ -114,7 +114,7 @@ func (c *Collector) PrintSummary() {
 	fmt.Printf("║  Avg proof time:         %12.2fms  ║\n", avgProofMs)
 	fmt.Printf("╠══════════════════════════════════════════╣\n")
 	fmt.Printf("║  Top tree build:         %12.2fms  ║\n", topTreeMs)
-	fmt.Printf("║  BUMP assembly (100tok): %12.2fms  ║\n", bumpAssemblyMs)
+	fmt.Printf("║  BUMP assembly (%4dtok):%12.2fms  ║\n", numBusinesses, bumpAssemblyMs)
 	fmt.Printf("║  Callbacks delivered:    %15d  ║\n", cbCount)
 	fmt.Printf("║  Avg callback time:      %12.2fms  ║\n", avgCbMs)
 	fmt.Printf("║  Avg BUMP size:          %12d B  ║\n", avgBumpBytes)

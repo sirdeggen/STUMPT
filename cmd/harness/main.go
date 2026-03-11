@@ -15,7 +15,8 @@
 //	-hashes-per-block   N    default 61440
 //	-hashes-per-subtree N    default 1024  (must divide hashes-per-block)
 //	-miners             N    default 3
-//	-duration           dur  default 10m  (controls txid submission rate)
+//	-businesses         N    default 100  (set to hashes-per-block for one BUMP per txid)
+//	-duration           dur  default 10s  (controls txid submission rate)
 //	-merkle-addr        addr default :18080
 //	-callback-addr      addr default :13000
 package main
@@ -45,6 +46,8 @@ func main() {
 		"Txids per subtree (must divide hashes-per-block)")
 	flag.IntVar(&cfg.NumMiners, "miners", cfg.NumMiners,
 		"Number of competing miners to simulate")
+	flag.IntVar(&cfg.NumBusinesses, "businesses", cfg.NumBusinesses,
+		"Number of distinct callback tokens (set equal to hashes-per-block for one BUMP per txid)")
 	flag.DurationVar(&cfg.TestDuration, "duration", cfg.TestDuration,
 		"Total test duration (controls submission rate)")
 	flag.StringVar(&cfg.MerkleServiceAddr, "merkle-addr", cfg.MerkleServiceAddr,
@@ -136,5 +139,5 @@ func main() {
 	msSrv.WaitForBlock(ctx)
 
 	// ── Summary ───────────────────────────────────────────────────────────────
-	mc.PrintSummary()
+	mc.PrintSummary(cfg.NumBusinesses)
 }

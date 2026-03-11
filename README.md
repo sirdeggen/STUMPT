@@ -136,12 +136,21 @@ This runs 61 440 txids (60 subtrees × 1 024) at ~102.4 txids/sec over 10 minute
 -hashes-per-block   int      Total txids per simulated block    (default 1024)
 -hashes-per-subtree int      Txids per subtree                  (default 64)
 -miners             int      Number of competing miners         (default 3)
+-businesses         int      Distinct callback tokens           (default 100)
 -duration           duration Total test duration                (default 10s)
 -merkle-addr        string   Merkle service listen address      (default :18080)
 -callback-addr      string   Callback server listen address     (default :13000)
 ```
 
 `hashes-per-block` must be divisible by `hashes-per-subtree`.
+
+**To simulate one BUMP per txid** (each token registers exactly one transaction), set `-businesses` equal to `-hashes-per-block`:
+
+```bash
+./harness -businesses 1024
+```
+
+**To simulate one compound BUMP per business** across many txids, keep `-businesses` well below `-hashes-per-block` (the default 100 gives ~10 txids per token at block size 1024).
 
 ---
 
