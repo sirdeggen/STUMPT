@@ -1,10 +1,11 @@
 package merkleservice
 
 import (
+	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
-	"math/rand"
+	mathrand "math/rand"
 	"sync"
 	"time"
 
@@ -199,21 +200,112 @@ func (r *Registry) sealSubtree(subtreeIdx int, baseTxids []chainhash.Hash) {
 	)
 }
 
-// finalizeBlock extracts the data needed to build and deliver BUMPs.
+// finalizeBlock simulates block discovery: replaces the coinbase placeholder
+// in subtree-0, re-seals it, recomputes affected proofs, then extracts the
+// data needed to build and deliver BUMPs.
 func (r *Registry) finalizeBlock() *BlockFinalizedEvent {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	slog.Info("block complete", "txids", len(r.allTxids))
 
-	// Collect miner-0 subtree roots.
+	// ── Coinbase replacement ────────────────────────────────────────────────
+	// At block discovery the real coinbase txid becomes known.  Simulate this
+	// by generating a random 32-byte hash and swapping it into position 0 of
+	// subtree-0 for every miner.
+	t0 := time.Now()
+
+	var coinbase chainhash.Hash
+	if _, err := rand.Read(coinbase[:]); err != nil {
+		slog.Error("coinbase: random generation failed", "err", err)
+	}
+	oldCoinbase := r.allTxids[0]
+	r.allTxids[0] = coinbase
+
+	slog.Info("coinbase replaced",
+		"old", hex.EncodeToString(oldCoinbase[:8]),
+		"new", hex.EncodeToString(coinbase[:8]),
+	)
+
+	// Re-seal subtree-0 for every miner: replace leaf-0, rebuild store+root.
+	for m := 0; m < r.cfg.NumMiners; m++ {
+		ms := r.minerSubtrees[m][0]
+		// Find where the old coinbase lives in this miner's leaf ordering.
+		// For miner-0 it's always index 0 (canonical order).
+		// For jittered miners it could have moved.
+		replaced := false
+		for i, h := range ms.Leaves {
+			if h == oldCoinbase {
+				ms.Leaves[i] = coinbase
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			slog.Error("coinbase: old coinbase not found in miner subtree",
+				"miner", m)
+		}
+		ms.Store = subtree.BuildMerkleStore(ms.Leaves)
+		ms.Root = ms.Store[len(ms.Store)-1]
+	}
+
+	// Recompute miner-0 proofs for all tokens that had txids in subtree-0.
+	// The sibling paths changed because the coinbase changed the left spine
+	// of the subtree-0 merkle tree.
+	miner0 := r.minerSubtrees[0][0]
+	localIdx := make(map[chainhash.Hash]int, r.cfg.HashesPerSubtree)
+	for i, h := range miner0.Leaves {
+		localIdx[h] = i
+	}
+
+	recomputedProofs := 0
+	for tok, proofList := range r.tokenProofs {
+		for i, p := range proofList {
+			if p.SubtreeIdx != 0 {
+				continue
+			}
+			// The txid itself may have changed (if this was the coinbase slot).
+			txid := p.TxID
+			if txid == oldCoinbase {
+				txid = coinbase
+			}
+			li, ok := localIdx[txid]
+			if !ok {
+				slog.Error("coinbase reseal: txid not found in miner-0 subtree-0",
+					"token", tok, "txid", hex.EncodeToString(txid[:8]))
+				continue
+			}
+			sp, err := subtree.GetProofFromStore(miner0.Leaves, miner0.Store, li)
+			if err != nil {
+				slog.Error("coinbase reseal: proof recomputation failed",
+					"token", tok, "err", err)
+				continue
+			}
+			r.tokenProofs[tok][i] = &SubtreeProof{
+				TxID:        txid,
+				SubtreeIdx:  0,
+				LocalIdx:    li,
+				GlobalIdx:   li,
+				SiblingPath: sp,
+			}
+			recomputedProofs++
+		}
+	}
+
+	coinbaseDur := time.Since(t0)
+	r.mc.RecordCoinbaseReseal(coinbaseDur)
+	slog.Info("coinbase reseal complete",
+		"duration", coinbaseDur,
+		"recomputedProofs", recomputedProofs,
+	)
+
+	// ── Build event ─────────────────────────────────────────────────────────
 	m0 := r.minerSubtrees[0]
 	roots := make([]chainhash.Hash, len(m0))
 	for i, ms := range m0 {
 		roots[i] = ms.Root
 	}
 
-	// Snapshot callbacks and proofs.
 	cbs := make(map[string]CallbackInfo, len(r.tokenCallback))
 	for k, v := range r.tokenCallback {
 		cbs[k] = v
@@ -260,7 +352,7 @@ func jitterTxids(txids []chainhash.Hash, minerIdx, subtreeIdx int, jitterFrac []
 	}
 
 	//nolint:gosec // deterministic seed is intentional for reproducibility
-	rng := rand.New(rand.NewSource(int64(minerIdx*1_000_000 + subtreeIdx)))
+	rng := mathrand.New(mathrand.NewSource(int64(minerIdx*1_000_000 + subtreeIdx)))
 	numSwaps := int(float64(len(result)) * jitterFrac[minerIdx])
 	for i := 0; i < numSwaps; i++ {
 		pos := rng.Intn(len(result) - 1)

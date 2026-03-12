@@ -253,17 +253,90 @@ func BenchmarkGetAllProofs1024(b *testing.B) {
 	}
 }
 
-// BenchmarkBuildMerkleStoreFullBlock measures the top-level tree for a full
-// 61440-txid block (60 subtrees padded to 64, so 64 subtree-roots as leaves).
-func BenchmarkBuildMerkleStoreFullBlock(b *testing.B) {
-	leaves := make([]chainhash.Hash, 64)
-	for i := range leaves {
-		leaves[i][0] = byte(i)
-	}
+// BenchmarkBuildMerkleStore10k measures BuildMerkleStore at 10k leaves.
+func BenchmarkBuildMerkleStore10k(b *testing.B) {
+	leaves := makeLeaves(10_000)
 	b.ResetTimer()
 	for range b.N {
 		_ = subtree.BuildMerkleStore(leaves)
 	}
+}
+
+// BenchmarkBuildMerkleStore100k measures BuildMerkleStore at 100k leaves.
+func BenchmarkBuildMerkleStore100k(b *testing.B) {
+	leaves := makeLeaves(100_000)
+	b.ResetTimer()
+	for range b.N {
+		_ = subtree.BuildMerkleStore(leaves)
+	}
+}
+
+// BenchmarkGetAllProofs10k measures GetAllProofs at 10k leaves.
+func BenchmarkGetAllProofs10k(b *testing.B) {
+	leaves := makeLeaves(10_000)
+	b.ResetTimer()
+	for range b.N {
+		_, _ = subtree.GetAllProofs(leaves)
+	}
+}
+
+// BenchmarkGetAllProofs100k measures GetAllProofs at 100k leaves.
+func BenchmarkGetAllProofs100k(b *testing.B) {
+	leaves := makeLeaves(100_000)
+	b.ResetTimer()
+	for range b.N {
+		_, _ = subtree.GetAllProofs(leaves)
+	}
+}
+
+// BenchmarkBuildMerkleStoreFullBlock measures the top-level tree for a full
+// 61440-txid block (60 subtrees padded to 64, so 64 subtree-roots as leaves).
+func BenchmarkBuildMerkleStoreFullBlock(b *testing.B) {
+	leaves := makeLeaves(64)
+	b.ResetTimer()
+	for range b.N {
+		_ = subtree.BuildMerkleStore(leaves)
+	}
+}
+
+// BenchmarkBuildMerkleStoreTopTree600k measures the top tree for 600k txids
+// (600 subtree roots padded to 1024).
+func BenchmarkBuildMerkleStoreTopTree600k(b *testing.B) {
+	leaves := makeLeaves(1024) // 600 subtrees padded to next power of 2
+	b.ResetTimer()
+	for range b.N {
+		_ = subtree.BuildMerkleStore(leaves)
+	}
+}
+
+// BenchmarkBuildMerkleStoreTopTree6M measures the top tree for 6M txids
+// (60k subtree roots padded to 65536).
+func BenchmarkBuildMerkleStoreTopTree6M(b *testing.B) {
+	leaves := makeLeaves(65_536)
+	b.ResetTimer()
+	for range b.N {
+		_ = subtree.BuildMerkleStore(leaves)
+	}
+}
+
+// BenchmarkBuildMerkleStoreTopTree600M measures the top tree for 600M txids
+// (600k subtree roots padded to 1M).
+func BenchmarkBuildMerkleStoreTopTree600M(b *testing.B) {
+	leaves := makeLeaves(1_048_576)
+	b.ResetTimer()
+	for range b.N {
+		_ = subtree.BuildMerkleStore(leaves)
+	}
+}
+
+func makeLeaves(n int) []chainhash.Hash {
+	leaves := make([]chainhash.Hash, n)
+	for i := range leaves {
+		leaves[i][0] = byte(i)
+		leaves[i][1] = byte(i >> 8)
+		leaves[i][2] = byte(i >> 16)
+	}
+	return leaves
 }
 
 // itoa is a minimal int-to-string helper to avoid importing strconv.

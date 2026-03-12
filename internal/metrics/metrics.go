@@ -25,8 +25,9 @@ type Collector struct {
 	proofComputeTotalNs atomic.Int64
 
 	// Block finalization phases
-	topTreeNs    atomic.Int64
-	bumpAssembly atomic.Int64
+	coinbaseResealNs atomic.Int64
+	topTreeNs        atomic.Int64
+	bumpAssembly     atomic.Int64
 
 	// Callback delivery
 	cbCount      atomic.Int64
@@ -57,6 +58,10 @@ func (c *Collector) RecordProofCompute(d time.Duration) {
 	c.proofComputeTotalNs.Add(d.Nanoseconds())
 }
 
+// RecordCoinbaseReseal records how long the coinbase replacement + subtree-0
+// re-seal + proof recomputation took at block time.
+func (c *Collector) RecordCoinbaseReseal(d time.Duration) { c.coinbaseResealNs.Store(d.Nanoseconds()) }
+
 // RecordTopTreeBuild records the top-tree assembly duration at block time.
 func (c *Collector) RecordTopTreeBuild(d time.Duration) { c.topTreeNs.Store(d.Nanoseconds()) }
 
@@ -86,6 +91,7 @@ func (c *Collector) PrintSummary(numBusinesses int) {
 
 	avgSealMs := avgMs(c.subtreeSealTotalNs.Load(), sealCount)
 	avgProofMs := avgMs(c.proofComputeTotalNs.Load(), proofCount)
+	coinbaseMs := float64(c.coinbaseResealNs.Load()) / 1e6
 	topTreeMs := float64(c.topTreeNs.Load()) / 1e6
 	bumpAssemblyMs := float64(c.bumpAssembly.Load()) / 1e6
 	avgCbMs := avgMs(c.cbTotalNs.Load(), cbCount)
@@ -113,6 +119,7 @@ func (c *Collector) PrintSummary(numBusinesses int) {
 	fmt.Printf("║  Proof pre-computations: %15d  ║\n", proofCount)
 	fmt.Printf("║  Avg proof time:         %12.2fms  ║\n", avgProofMs)
 	fmt.Printf("╠══════════════════════════════════════════╣\n")
+	fmt.Printf("║  Coinbase reseal:        %12.2fms  ║\n", coinbaseMs)
 	fmt.Printf("║  Top tree build:         %12.2fms  ║\n", topTreeMs)
 	fmt.Printf("║  BUMP assembly (%4dtok):%12.2fms  ║\n", numBusinesses, bumpAssemblyMs)
 	fmt.Printf("║  Callbacks delivered:    %15d  ║\n", cbCount)
