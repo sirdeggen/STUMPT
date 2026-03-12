@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/stumpt/internal/config"
 	"github.com/bsv-blockchain/stumpt/internal/metrics"
 )
@@ -25,6 +26,7 @@ type Server struct {
 }
 
 // NewServer creates a Server bound to ln, wiring up the Registry.
+// ln may be nil for direct-mode operation (no HTTP serving).
 func NewServer(cfg *config.Config, mc *metrics.Collector, ln net.Listener) *Server {
 	s := &Server{
 		cfg:     cfg,
@@ -38,6 +40,7 @@ func NewServer(cfg *config.Config, mc *metrics.Collector, ln net.Listener) *Serv
 }
 
 // Start runs the HTTP server until ctx is cancelled.
+// Panics if ln is nil (use direct mode instead).
 func (s *Server) Start(ctx context.Context) {
 	s.ctx = ctx
 	h := &handler{reg: s.reg, srv: s}
@@ -62,6 +65,26 @@ func (s *Server) WaitForBlock(ctx context.Context) {
 	case <-s.blockCh:
 	case <-ctx.Done():
 	}
+}
+
+// AddTxIDDirect is the in-process fast path for direct-mode operation.
+// It bypasses HTTP/JSON encoding and calls the registry directly.
+// Returns a *BlockFinalizedEvent (as interface{}) when the block is complete,
+// or nil otherwise. The caller should pass the event to ProcessBlock.
+func (s *Server) AddTxIDDirect(txid chainhash.Hash, token, callbackURL string) interface{} {
+	cb := CallbackInfo{URL: callbackURL, Token: token}
+	return s.reg.AddTxIDDirect(txid, token, cb)
+}
+
+// ProcessBlock runs the BUMP assembly and delivery pipeline for a completed
+// block. Used in direct mode where the caller drives the block lifecycle
+// instead of the HTTP handler.
+func (s *Server) ProcessBlock(evt interface{}) {
+	blockEvt, ok := evt.(*BlockFinalizedEvent)
+	if !ok || blockEvt == nil {
+		return
+	}
+	s.onBlockComplete(blockEvt)
 }
 
 // deliveryTimeout is the maximum time allowed for BUMP assembly + delivery
@@ -95,5 +118,10 @@ func (s *Server) onBlockComplete(evt *BlockFinalizedEvent) {
 	)
 
 	slog.Info("block pipeline complete")
-	close(s.blockCh)
+	// Close blockCh only once.
+	select {
+	case <-s.blockCh:
+	default:
+		close(s.blockCh)
+	}
 }

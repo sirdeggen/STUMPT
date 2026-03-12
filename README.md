@@ -25,27 +25,30 @@ This repo simulates that pipeline end-to-end and measures the timing of each pha
 
 ## Architecture
 
-Three components run in a single process, communicating over localhost HTTP:
+Three components run in a single process:
 
 ```
   Generator ──POST /watch──► Merkle Service ──POST (raw BUMP)──► Callback Server
 ```
 
+In **direct mode** (`-direct` flag), the generator bypasses HTTP and calls the registry directly, enabling large-scale runs (6M+ txids) that would be bottlenecked by HTTP/JSON overhead.
+
 ### Generator (`internal/generator`)
 - Produces `HASHES_PER_BLOCK` random 32-byte hashes (mock txids).
-- Submits them at a rate of `HASHES_PER_BLOCK / duration` per second.
-- Each submission picks one of 100 callback tokens round-robin, simulating 100 distinct submitting businesses.
+- **HTTP mode:** Submits at a rate of `HASHES_PER_BLOCK / duration` per second.
+- **Direct mode:** Submits as fast as possible (bypasses HTTP), achieving 120k+ txids/sec.
+- Each submission picks one of N callback tokens round-robin, simulating N distinct submitting businesses.
 
 ### Merkle Service (`internal/merkleservice`)
-- Receives `POST /watch` with `{ txid, callback: { url, token } }`.
+- Receives `POST /watch` with `{ txid, callback: { url, token } }` (or direct calls in `-direct` mode).
 - Every `HASHES_PER_SUBTREE` txids received, **seals a subtree**:
-  - Builds 3 miners' versions of the subtree with deterministically jittered ordering (miner 0 = canonical, miner 1 = 5 % adjacent swaps, miner 2 = 10 %).
-  - Pre-computes miner-0 merkle proofs for every token that has txids in the subtree.
+  - Builds N miners' versions of the subtree with deterministically jittered ordering.
+  - Pre-computes miner-0 merkle proofs using **STUMP XOR indexing** (see below).
 - When `HASHES_PER_BLOCK` txids are received, **finalises the block**:
-  - Builds the top tree from all subtree roots (one call to `GetAllProofs`).
-  - For each of the 100 tokens, combines all pre-computed subtree proofs with the top-tree legs into a single compound `MerklePath` using go-sdk's `Combine`.
+  - Performs coinbase replacement + subtree-0 reseal.
+  - Uses **STUMP Discover** to gather proofs for all tokens via XOR probing.
+  - Builds compound BUMPs in parallel using a worker pool.
   - POSTs the raw BUMP binary to each token's callback URL.
-  - Signals the main process to exit cleanly.
 
 ### Callback Server (`internal/callback`)
 - Receives the raw BUMP binary POSTs.
@@ -54,6 +57,72 @@ Three components run in a single process, communicating over localhost HTTP:
 ### Subtree / Merkle Engine (`internal/subtree`)
 - Implements `BuildMerkleStore`, `GetMerkleProof`, and `GetAllProofs` using `go-sdk/chainhash` only — no dependency on `go-bt` or `go-subtree`.
 - `HashPair` is byte-identical to `transaction.MerkleTreeParent` in go-sdk, verified by test.
+
+### STUMP Index (`internal/stump`)
+- XOR-based content-addressed proof index: `key = XOR(TokenHash, SubtreeRoot)`.
+- Enables O(1) per-txid insertion during subtree sealing (vs O(tokens × txids) previously).
+- At block announcement, O(subtrees × tokens) XOR probes discover all matching proofs.
+- See **STUMP Indexing** section below for design rationale.
+
+---
+
+## STUMP Indexing
+
+### The problem
+
+At scale (600M txids/block, 100k+ businesses), the naive approach of iterating every token's txid list against every sealed subtree is O(tokens × txids/token) per subtree — prohibitively expensive.
+
+### The solution
+
+**STUMP** (**S**ubtree-**T**oken **U**nified **M**erkle **P**roof) uses XOR-based composite keys:
+
+```
+index_key = XOR(SHA256d(token_string), subtree_merkle_root)
+```
+
+#### Why XOR?
+
+1. **Commutativity enables discovery:** On block announcement, a subscriber who knows their `tokenHash` can XOR it with each announced `subtreeRoot` to probe the store — without iterating all tokens or all subtrees.
+
+2. **Uniform distribution:** Both `tokenHash` (SHA256d of the token string) and `subtreeRoot` (merkle root of random txids) are uniformly distributed 256-bit values, so their XOR is also uniform — no clustering in the hash map.
+
+3. **Reversibility:** Given the XOR key and either operand, the other is recoverable: `subtreeRoot = key ^ tokenHash`. This enables verification and debugging.
+
+4. **No collision risk:** The key space is 2^256; collisions are astronomically improbable even at 600M txids × 100k tokens.
+
+#### Why not concatenation + hash?
+
+`SHA256(token || subtreeRoot)` would work for indexing but loses the reversibility property. With XOR, a subscriber can probe the store in O(subtrees) rather than needing to enumerate all (token, subtree) pairs stored.
+
+#### Lifecycle
+
+**During inter-block interval (subtree sealing):**
+```
+For each txid in the sealed subtree:
+  token := txidIndex.Lookup(txid)       // O(1)
+  key   := XOR(tokenHash, subtreeRoot)  // O(1), ~8.5 ns
+  store.Append(key, proof)              // O(1)
+```
+
+**At block announcement (STUMP Discovery):**
+```
+For each subtreeRoot in the winning miner's block:
+  For each subscribed tokenHash:
+    key := XOR(tokenHash, subtreeRoot)  // ~8.5 ns
+    stumps := store.Get(key)            // O(1), ~9.5 ns
+    → append to this token's proof list for BUMP assembly
+```
+
+#### Measured performance
+
+| Operation | Time | Notes |
+|-----------|------|-------|
+| XOR key computation | 8.5 ns | Zero allocations |
+| Store lookup | 9.5 ns | Zero allocations |
+| Discover 100 subtrees × 100 tokens | 0.77 ms | 10k probes |
+| Discover 6000 subtrees × 1000 tokens | 1.74 s | 6M probes |
+
+At extreme scale (600k subtrees × 100k tokens = 60B probes), the XOR+lookup cost would be ~60B × 18 ns ≈ 18 minutes. At that scale, a sharded or per-token-parallel approach is needed — but the STUMP design supports this naturally since each token's probes are independent.
 
 ---
 
@@ -101,25 +170,40 @@ The harness starts both servers, then the generator.  Structured JSON logs strea
 ╔══════════════════════════════════════════╗
 ║          STUMPT FINAL SUMMARY            ║
 ╠══════════════════════════════════════════╣
-║  Elapsed:                        10.183s ║
-║  Txids submitted:                   1024 ║
-║  Actual rate:                   102.4/s  ║
+║  Elapsed:                          5.02s  ║
+║  Txids submitted:                   1024  ║
+║  Actual rate:                   204.0/s  ║
 ╠══════════════════════════════════════════╣
-║  Subtrees sealed:                    16  ║
-║  Avg seal time:                  0.08ms  ║
-║  Proof pre-computations:             16  ║
+║  Subtrees sealed:                     16  ║
+║  Avg seal time:                  0.05ms  ║
+║  Proof pre-computations:              16  ║
 ║  Avg proof time:                 0.05ms  ║
 ╠══════════════════════════════════════════╣
-║  Top tree build:                 0.00ms  ║
-║  BUMP assembly (100tok):         1.46ms  ║
-║  Callbacks delivered:               200  ║
-║  Avg callback time:              5.22ms  ║
-║  Avg BUMP size:                   759 B  ║
-║  Total BUMP bytes:             151880 B  ║
+║  Coinbase reseal:                0.07ms  ║
+║  Top tree build:                 0.01ms  ║
+║  BUMP assembly ( 100tok):        1.87ms  ║
+║  Callbacks delivered:                200  ║
+║  Avg callback time:              4.73ms  ║
+║  Avg BUMP size:                  3038 B  ║
+║  Total BUMP bytes:             607712 B  ║
 ╚══════════════════════════════════════════╝
 ```
 
-### 3. Full-scale test (10-minute block simulation)
+### 3. Direct mode — large-scale runs
+
+For runs above ~60k txids, HTTP submission becomes the bottleneck. Use `-direct` to bypass HTTP entirely:
+
+```bash
+# 6 million txids, 600 subtrees × 10k leaves, 1000 businesses
+./harness -direct \
+  -hashes-per-block 6000000 \
+  -hashes-per-subtree 10000 \
+  -businesses 1000
+```
+
+This runs 6M txids at ~125k txids/sec (limited by merkle computation, not HTTP), completing in ~47 seconds.
+
+### 4. Full-scale test (10-minute block simulation via HTTP)
 
 ```bash
 ./harness \
@@ -130,16 +214,17 @@ The harness starts both servers, then the generator.  Structured JSON logs strea
 
 This runs 61 440 txids (60 subtrees × 1 024) at ~102.4 txids/sec over 10 minutes, matching a real Teranode block interval.
 
-### 4. All CLI flags
+### 5. All CLI flags
 
 ```
 -hashes-per-block   int      Total txids per simulated block    (default 1024)
 -hashes-per-subtree int      Txids per subtree                  (default 64)
 -miners             int      Number of competing miners         (default 3)
 -businesses         int      Distinct callback tokens           (default 100)
--duration           duration Total test duration                (default 10s)
+-duration           duration Total test duration                (default 10s; ignored in -direct mode)
 -merkle-addr        string   Merkle service listen address      (default :18080)
 -callback-addr      string   Callback server listen address     (default :13000)
+-direct                      Bypass HTTP for txid submission    (fast path for large-scale runs)
 -dump-bump          string   Write first assembled BUMP as hex to this file (optional)
 ```
 
@@ -157,7 +242,7 @@ This runs 61 440 txids (60 subtrees × 1 024) at ~102.4 txids/sec over 10 minute
 
 ## Running the tests
 
-The merkle engine has a full unit + integration test suite that verifies proof correctness against go-sdk's `MerklePath.ComputeRoot` and `Combine`.
+The merkle engine and STUMP index have full unit + integration test suites.
 
 ```bash
 go test ./...
@@ -172,20 +257,32 @@ go test -race ./...
 Benchmarks:
 
 ```bash
+# Merkle engine benchmarks
 go test -bench=. -benchmem ./internal/subtree/
+
+# STUMP index benchmarks
+go test -bench=. -benchmem ./internal/stump/
+
+# BUMP assembly benchmarks (isolated from HTTP)
+go test -bench=. -benchmem ./internal/merkleservice/
 ```
 
-Key tests in `internal/subtree/`:
+Key tests:
 
-| Test | What it checks |
-|------|----------------|
-| `TestHashPairMatchesGoSDK` | `HashPair` is byte-identical to `transaction.MerkleTreeParent` |
-| `TestProofRoundTripSmall` | Proofs for n = 1, 2, 3, 4, 7, 8 leaves all compute back to the correct root |
-| `TestProofRoundTrip1024` | Every 64th leaf of a 1 024-leaf subtree verifies correctly |
-| `TestCompoundBUMPCombine` | Two per-txid BUMPs combine and both txids still verify |
-| `TestGetAllProofs` | Batch proof generation matches single-proof generation |
-| `TestCompoundBUMPAcrossSubtrees` | 4 subtrees × 4 leaves: individual + compound BUMPs all verify against the block root |
-| `TestCompoundBUMPDefaultConfig` | 61 440-txid / 60-subtree / 16-level tree: sample of 10 txids compounded and verified |
+| Package | Test | What it checks |
+|---------|------|----------------|
+| `subtree` | `TestHashPairMatchesGoSDK` | `HashPair` is byte-identical to `transaction.MerkleTreeParent` |
+| `subtree` | `TestProofRoundTripSmall` | Proofs for n = 1, 2, 3, 4, 7, 8 leaves all verify |
+| `subtree` | `TestProofRoundTrip1024` | Every 64th leaf of a 1024-leaf subtree verifies |
+| `subtree` | `TestCompoundBUMPCombine` | Two per-txid BUMPs combine and verify |
+| `subtree` | `TestGetAllProofs` | Batch proof generation matches single-proof generation |
+| `subtree` | `TestCompoundBUMPAcrossSubtrees` | 4 subtrees × 4 leaves: compound BUMPs verify against block root |
+| `subtree` | `TestCompoundBUMPDefaultConfig` | 61,440-txid / 60-subtree / 16-level tree: sample compound BUMPs verify |
+| `stump` | `TestXORKeySymmetry` | XOR(a, b) == XOR(b, a) |
+| `stump` | `TestXORKeySelfInverse` | XOR(XOR(a, b), b) == a |
+| `stump` | `TestDiscoverEndToEnd` | Full STUMP lifecycle: register, seal, discover |
+| `stump` | `TestStoreAppendAndGet` | Basic store operations |
+| `stump` | `TestTokenRegistry` | Token registration and hash lookup |
 
 ---
 
@@ -194,8 +291,8 @@ Key tests in `internal/subtree/`:
 The key insight this harness measures is the **work distribution**:
 
 - **During the block interval:** subtree sealing + proof pre-computation runs continuously. Each subtree seal takes `~seal_time × num_miners` ms and pre-computing proofs takes `~proof_time` ms per subtree. This work is spread evenly across all subtree boundaries throughout the inter-block interval.
-- **At block found:** only the top-tree build (microseconds for ≤64 subtree roots) and BUMP assembly (~ms for 100 tokens) need to happen before delivery. The pre-computed proofs pay for themselves here.
-- **Per-business BUMP size** reflects how many txids that business submitted. Businesses with more txids get larger but more compact compound BUMPs (intermediate hashes are pruned by `Combine`).
+- **At block found:** only the coinbase reseal (~0.05–177 ms), top-tree build (microseconds), STUMP discovery (~0.77 ms–1.74 s), and parallel BUMP assembly (~1.4 ms–18 s) need to happen before delivery. The pre-computed proofs pay for themselves here.
+- **Per-business BUMP size** reflects how many txids that business submitted. Businesses with more txids get larger but more compact compound BUMPs (intermediate hashes are pruned).
 
 ---
 

@@ -8,7 +8,9 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"runtime"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
@@ -18,7 +20,8 @@ import (
 )
 
 // processBUMPs is the entry-point for block-finalization BUMP work.
-// It builds compound BUMPs for all tokens and delivers them via HTTP.
+// It builds compound BUMPs for all tokens using a parallel worker pool
+// and delivers them via HTTP.
 // If dumpFile is non-empty the first assembled BUMP is written as a hex string.
 func processBUMPs(
 	ctx context.Context,
@@ -45,60 +48,119 @@ func processBUMPs(
 		"duration", time.Since(t0),
 	)
 
-	// Assemble a compound BUMP for each token.
+	// Assemble compound BUMPs using a parallel worker pool.
+	// BUMP assembly is embarrassingly parallel: each token's BUMP is
+	// independent. We use min(GOMAXPROCS, numTokens) workers.
 	t1 := time.Now()
 	type result struct {
 		token string
 		cb    CallbackInfo
 		data  []byte
 	}
-	results := make([]result, 0, len(evt.Callbacks))
-	total := len(evt.Callbacks)
 
+	// Collect all tokens into a slice for deterministic ordering.
+	type tokenWork struct {
+		token  string
+		cb     CallbackInfo
+		proofs []*SubtreeProof
+	}
+	work := make([]tokenWork, 0, len(evt.Callbacks))
 	for token, cb := range evt.Callbacks {
 		proofs := evt.TokenProofs[token]
 		if len(proofs) == 0 {
 			slog.Warn("no proofs for token, skipping", "token", token)
 			continue
 		}
-
-		bump, err := buildCompoundBUMP(
-			blockHeight, proofs, topProofs,
-			subtreeHeight, topTreeHeight, totalHeight,
-		)
-		if err != nil {
-			slog.Error("BUMP build failed", "token", token, "err", err)
-			continue
-		}
-
-		bumpBytes := bump.Bytes()
-		results = append(results, result{token: token, cb: cb, data: bumpBytes})
-
-		// Dump the first BUMP to file as hex if requested.
-		if dumpFile != "" && len(results) == 1 {
-			dumpBUMPHex(dumpFile, token, bumpBytes)
-		}
-
-		// Log progress every 10% for large token counts.
-		if done := len(results); total >= 10 && done%(total/10) == 0 {
-			slog.Info("BUMP assembly progress",
-				"done", done,
-				"total", total,
-				"elapsed", time.Since(t1).Round(time.Millisecond),
-			)
-		}
+		work = append(work, tokenWork{token: token, cb: cb, proofs: proofs})
 	}
+
+	total := len(work)
+	numWorkers := runtime.GOMAXPROCS(0)
+	if numWorkers > total {
+		numWorkers = total
+	}
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+
+	slog.Info("BUMP assembly starting",
+		"tokens", total,
+		"workers", numWorkers,
+	)
+
+	results := make([]result, total)
+	var wg sync.WaitGroup
+	workCh := make(chan int, total)
+
+	// Track progress atomically.
+	var doneCount sync.Mutex
+	done := 0
+
+	// Launch workers.
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range workCh {
+				tw := work[idx]
+				bump, err := buildCompoundBUMP(
+					blockHeight, tw.proofs, topProofs,
+					subtreeHeight, topTreeHeight, totalHeight,
+				)
+				if err != nil {
+					slog.Error("BUMP build failed", "token", tw.token, "err", err)
+					continue
+				}
+				bumpBytes := bump.Bytes()
+				results[idx] = result{token: tw.token, cb: tw.cb, data: bumpBytes}
+
+				// Log progress every 10% for large token counts.
+				doneCount.Lock()
+				done++
+				d := done
+				doneCount.Unlock()
+				if total >= 10 && d%(total/10) == 0 {
+					slog.Info("BUMP assembly progress",
+						"done", d,
+						"total", total,
+						"elapsed", time.Since(t1).Round(time.Millisecond),
+					)
+				}
+			}
+		}()
+	}
+
+	// Enqueue work.
+	for i := range work {
+		workCh <- i
+	}
+	close(workCh)
+	wg.Wait()
 
 	mc.RecordBUMPAssembly(time.Since(t1))
 	slog.Info("BUMPs assembled",
-		"tokens", len(results),
+		"tokens", total,
+		"workers", numWorkers,
 		"assemblyDuration", time.Since(t1),
 	)
+
+	// Dump the first non-empty BUMP to file as hex if requested.
+	if dumpFile != "" {
+		for _, r := range results {
+			if len(r.data) > 0 {
+				dumpBUMPHex(dumpFile, r.token, r.data)
+				break
+			}
+		}
+	}
 
 	// Deliver each BUMP to the callback URL.
 	client := &http.Client{Timeout: 15 * time.Second}
 	blockTime := time.Now()
 	for _, r := range results {
+		if len(r.data) == 0 {
+			continue
+		}
 		deliverBUMP(ctx, client, mc, r.cb, r.token, r.data, blockTime)
 	}
 }
