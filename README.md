@@ -1,6 +1,6 @@
 # STUMPT
 
-**S**ubtree + **T**imed **U**tility for **M**erkle **P**ath **T**esting
+**S**ubTree Unified **M**erkle **P**ath **T**esting
 
 A performance test harness for the theory behind incremental compound BUMP (BRC-74) generation at block-scale transaction volumes.
 
