@@ -12,6 +12,7 @@ import (
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/stumpt/internal/config"
+	"github.com/bsv-blockchain/stumpt/internal/diskstore"
 	"github.com/bsv-blockchain/stumpt/internal/metrics"
 )
 
@@ -27,11 +28,11 @@ type Server struct {
 
 // NewServer creates a Server bound to ln, wiring up the Registry.
 // ln may be nil for direct-mode operation (no HTTP serving).
-func NewServer(cfg *config.Config, mc *metrics.Collector, ln net.Listener) *Server {
+func NewServer(cfg *config.Config, mc *metrics.Collector, ln net.Listener, db *diskstore.DB) *Server {
 	s := &Server{
 		cfg:     cfg,
 		mc:      mc,
-		reg:     newRegistry(cfg, mc),
+		reg:     newRegistry(cfg, mc, db),
 		ln:      ln,
 		blockCh: make(chan struct{}),
 		ctx:     context.Background(),

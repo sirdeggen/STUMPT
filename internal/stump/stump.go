@@ -88,6 +88,21 @@ func TokenHash(token string) chainhash.Hash {
 	return chainhash.Hash(sha256.Sum256(h1[:]))
 }
 
+// StumpStore is the interface for storing and retrieving STUMP entries by XOR key.
+type StumpStore interface {
+	Append(key Key, e *Entry)
+	AppendBatch(key Key, entries []*Entry)
+	Get(key Key) []*Entry
+	Len() int
+}
+
+// TxIDIndexer is the interface for the txid→token reverse index.
+type TxIDIndexer interface {
+	Set(txid chainhash.Hash, token string)
+	Get(txid chainhash.Hash) (string, bool)
+	Len() int
+}
+
 // Entry is a single proof entry stored under a STUMP key.
 // It records one txid's subtree-level proof along with its position metadata.
 type Entry struct {
@@ -241,7 +256,7 @@ func (tr *TokenRegistry) Len() int {
 // + O(1) map lookups per probe. At 6000 subtrees × 100k tokens = 600M XOR ops,
 // each XOR is ~2ns on modern hardware = ~1.2s. For smaller scales this is
 // sub-millisecond.
-func Discover(store *Store, registry *TokenRegistry, subtreeRoots []chainhash.Hash) map[string][]*Entry {
+func Discover(store StumpStore, registry *TokenRegistry, subtreeRoots []chainhash.Hash) map[string][]*Entry {
 	tokens := registry.Tokens()
 	result := make(map[string][]*Entry, len(tokens))
 

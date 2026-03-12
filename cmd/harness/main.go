@@ -39,6 +39,7 @@ import (
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/stumpt/internal/callback"
 	"github.com/bsv-blockchain/stumpt/internal/config"
+	"github.com/bsv-blockchain/stumpt/internal/diskstore"
 	"github.com/bsv-blockchain/stumpt/internal/generator"
 	"github.com/bsv-blockchain/stumpt/internal/merkleservice"
 	"github.com/bsv-blockchain/stumpt/internal/metrics"
@@ -65,6 +66,8 @@ func main() {
 		"Callback server listen address")
 	flag.StringVar(&cfg.DumpBUMPFile, "dump-bump", cfg.DumpBUMPFile,
 		"If set, write the first assembled BUMP as a hex string to this file")
+	flag.StringVar(&cfg.DataDir, "data-dir", cfg.DataDir,
+		"BadgerDB data directory (empty = temp dir)")
 	flag.BoolVar(&directMode, "direct", false,
 		"Bypass HTTP for txid submission (fast path for large-scale runs)")
 	flag.Parse()
@@ -119,6 +122,13 @@ func main() {
 // runDirect runs the harness in direct mode — no HTTP, no ticker pacing.
 // Txids are submitted directly to the registry for maximum throughput.
 func runDirect(cfg *config.Config, mc *metrics.Collector) {
+	db, err := diskstore.Open(cfg.DataDir)
+	if err != nil {
+		slog.Error("badgerdb: open failed", "err", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+
 	// In direct mode we still need the callback server for BUMP delivery.
 	ctx, cancel := context.WithTimeout(
 		context.Background(),
@@ -164,7 +174,7 @@ func runDirect(cfg *config.Config, mc *metrics.Collector) {
 
 	// Create the merkle service server to get access to the registry's
 	// AddTxIDDirect method and the onBlockComplete pipeline.
-	msSrv := merkleservice.NewServer(cfg, mc, nil)
+	msSrv := merkleservice.NewServer(cfg, mc, nil, db)
 
 	// Run the direct generator.
 	gen := generator.NewDirect(cfg, mc)
@@ -189,6 +199,13 @@ func runDirect(cfg *config.Config, mc *metrics.Collector) {
 
 // runHTTP runs the original HTTP-based harness.
 func runHTTP(cfg *config.Config, mc *metrics.Collector) {
+	db, err := diskstore.Open(cfg.DataDir)
+	if err != nil {
+		slog.Error("badgerdb: open failed", "err", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+
 	// The main context governs HTTP servers and the generator.
 	ctx, cancel := context.WithTimeout(
 		context.Background(),
@@ -231,7 +248,7 @@ func runHTTP(cfg *config.Config, mc *metrics.Collector) {
 	go cbSrv.Start(ctx)
 
 	// ── Start merkle service ──────────────────────────────────────────────────
-	msSrv := merkleservice.NewServer(cfg, mc, msLn)
+	msSrv := merkleservice.NewServer(cfg, mc, msLn, db)
 	go msSrv.Start(ctx)
 
 	// ── Run generator (blocks until all txids submitted) ─────────────────────

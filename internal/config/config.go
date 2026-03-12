@@ -31,6 +31,10 @@ type Config struct {
 	// DumpBUMPFile is an optional file path.  When non-empty the first
 	// assembled compound BUMP is written as a UTF-8 hex string to this file.
 	DumpBUMPFile string
+
+	// DataDir is the directory for BadgerDB on-disk storage.
+	// When empty, a temporary directory is created and removed on close.
+	DataDir string
 }
 
 // Default returns a Config with the standard test parameters.
