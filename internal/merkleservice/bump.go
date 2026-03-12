@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
@@ -48,6 +49,7 @@ func processBUMPs(
 		data  []byte
 	}
 	results := make([]result, 0, len(evt.Callbacks))
+	total := len(evt.Callbacks)
 
 	for token, cb := range evt.Callbacks {
 		proofs := evt.TokenProofs[token]
@@ -66,6 +68,15 @@ func processBUMPs(
 		}
 
 		results = append(results, result{token: token, cb: cb, data: bump.Bytes()})
+
+		// Log progress every 10% for large token counts.
+		if done := len(results); total >= 10 && done%(total/10) == 0 {
+			slog.Info("BUMP assembly progress",
+				"done", done,
+				"total", total,
+				"elapsed", time.Since(t1).Round(time.Millisecond),
+			)
+		}
 	}
 
 	mc.RecordBUMPAssembly(time.Since(t1))
@@ -83,86 +94,104 @@ func processBUMPs(
 }
 
 // buildCompoundBUMP creates a single MerklePath that covers all of a token's
-// txids in the block by combining individual per-txid BUMPs.
+// txids in one O(n·h) pass — no repeated Combine calls.
+//
+// Strategy:
+//  1. Accumulate every PathElement from every per-txid proof into a
+//     map[level]map[offset]*PathElement.  Because all proofs share the same
+//     block tree, duplicate offsets at the same level always carry the same
+//     hash, so last-write is fine.
+//  2. Prune intermediate nodes whose both children are already present
+//     (identical to what Combine does internally, but only once).
+//  3. Sort each level by offset and wrap in a MerklePath.
 func buildCompoundBUMP(
 	blockHeight uint32,
 	proofs []*SubtreeProof,
-	topProofs [][]*chainhash.Hash, // topProofs[subtreeIdx] = top-tree sibling path
-	subtreeHeight, topTreeHeight, totalHeight int,
-) (*gosdk.MerklePath, error) {
-	var combined *gosdk.MerklePath
-
-	for _, proof := range proofs {
-		single, err := buildSingleBUMP(blockHeight, proof, topProofs, subtreeHeight, topTreeHeight, totalHeight)
-		if err != nil {
-			return nil, fmt.Errorf("buildSingle: %w", err)
-		}
-		if combined == nil {
-			combined = single
-			continue
-		}
-		if err := combined.Combine(single); err != nil {
-			return nil, fmt.Errorf("combine: %w", err)
-		}
-	}
-
-	return combined, nil
-}
-
-// buildSingleBUMP creates a full-block-height BUMP for one txid.
-//
-// BUMP level layout:
-//
-//	levels  0 … subtreeHeight-1  : subtree-internal sibling hashes
-//	levels  subtreeHeight … totalHeight-1 : top-tree sibling hashes
-//
-// At BUMP level k the sibling's block-level offset is (globalLeafOffset >> k) ^ 1.
-func buildSingleBUMP(
-	blockHeight uint32,
-	proof *SubtreeProof,
 	topProofs [][]*chainhash.Hash,
 	subtreeHeight, topTreeHeight, totalHeight int,
 ) (*gosdk.MerklePath, error) {
+	if len(proofs) == 0 {
+		return nil, fmt.Errorf("buildCompoundBUMP: no proofs")
+	}
+
+	// merged[level][offset] = PathElement
+	merged := make([]map[uint64]*gosdk.PathElement, totalHeight)
+	for i := range merged {
+		merged[i] = make(map[uint64]*gosdk.PathElement)
+	}
+
+	// Accumulate all elements from every per-txid proof.
+	for _, proof := range proofs {
+		if err := accumulateProof(proof, topProofs, subtreeHeight, topTreeHeight, totalHeight, merged); err != nil {
+			return nil, err
+		}
+	}
+
+	// Prune: remove a node at level h if both its children (at h-1) are
+	// present — it can be recomputed and is redundant in the BUMP.
+	for h := totalHeight - 1; h > 0; h-- {
+		for offset := range merged[h] {
+			childL := offset * 2
+			childR := offset*2 + 1
+			_, hasL := merged[h-1][childL]
+			_, hasR := merged[h-1][childR]
+			if hasL && hasR {
+				delete(merged[h], offset)
+			}
+		}
+	}
+
+	// Build the final [][]*PathElement, sorted by offset per level.
+	path := make([][]*gosdk.PathElement, totalHeight)
+	for h := 0; h < totalHeight; h++ {
+		level := make([]*gosdk.PathElement, 0, len(merged[h]))
+		for _, el := range merged[h] {
+			level = append(level, el)
+		}
+		sort.Slice(level, func(i, j int) bool { return level[i].Offset < level[j].Offset })
+		path[h] = level
+	}
+
+	return gosdk.NewMerklePath(blockHeight, path), nil
+}
+
+// accumulateProof inserts all PathElements for one txid proof into merged.
+func accumulateProof(
+	proof *SubtreeProof,
+	topProofs [][]*chainhash.Hash,
+	subtreeHeight, topTreeHeight, totalHeight int,
+	merged []map[uint64]*gosdk.PathElement,
+) error {
 	if len(proof.SiblingPath) < subtreeHeight {
-		return nil, fmt.Errorf("subtree proof too short: got %d want %d",
-			len(proof.SiblingPath), subtreeHeight)
+		return fmt.Errorf("subtree proof too short: got %d want %d", len(proof.SiblingPath), subtreeHeight)
 	}
 	si := proof.SubtreeIdx
 	if si >= len(topProofs) || len(topProofs[si]) < topTreeHeight {
-		return nil, fmt.Errorf("top-tree proof missing for subtree %d", si)
+		return fmt.Errorf("top-tree proof missing for subtree %d", si)
 	}
 
 	g := uint64(proof.GlobalIdx) //nolint:gosec
 
-	path := make([][]*gosdk.PathElement, totalHeight)
-
-	// ── Level 0: txid itself + its leaf sibling ──────────────────────────────
+	// Level 0: txid itself + leaf sibling.
 	txidHash := proof.TxID
-	sibHash0 := proof.SiblingPath[0]
-	path[0] = []*gosdk.PathElement{
-		{Offset: g, Hash: &txidHash, Txid: boolPtr(true)},
-		{Offset: g ^ 1, Hash: sibHash0},
-	}
+	merged[0][g] = &gosdk.PathElement{Offset: g, Hash: &txidHash, Txid: boolPtr(true)}
+	merged[0][g^1] = &gosdk.PathElement{Offset: g ^ 1, Hash: proof.SiblingPath[0]}
 
-	// ── Subtree levels 1 … subtreeHeight-1 ──────────────────────────────────
+	// Subtree levels 1 … subtreeHeight-1.
 	for k := 1; k < subtreeHeight; k++ {
 		sibOffset := (g >> k) ^ 1
-		path[k] = []*gosdk.PathElement{
-			{Offset: sibOffset, Hash: proof.SiblingPath[k]},
-		}
+		merged[k][sibOffset] = &gosdk.PathElement{Offset: sibOffset, Hash: proof.SiblingPath[k]}
 	}
 
-	// ── Top-tree levels subtreeHeight … totalHeight-1 ────────────────────────
+	// Top-tree levels subtreeHeight … totalHeight-1.
 	tp := topProofs[si]
 	for k := 0; k < topTreeHeight; k++ {
 		blockLevel := subtreeHeight + k
 		sibOffset := (g >> blockLevel) ^ 1
-		path[blockLevel] = []*gosdk.PathElement{
-			{Offset: sibOffset, Hash: tp[k]},
-		}
+		merged[blockLevel][sibOffset] = &gosdk.PathElement{Offset: sibOffset, Hash: tp[k]}
 	}
 
-	return gosdk.NewMerklePath(blockHeight, path), nil
+	return nil
 }
 
 // deliverBUMP HTTP-POSTs raw BUMP bytes to the callback URL.
