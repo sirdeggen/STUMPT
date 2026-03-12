@@ -91,6 +91,7 @@ func (s *Server) onBlockComplete(evt *BlockFinalizedEvent) {
 		s.mc,
 		evt,
 		s.cfg.CallbackURL(),
+		s.cfg.DumpBUMPFile,
 	)
 
 	slog.Info("block pipeline complete")

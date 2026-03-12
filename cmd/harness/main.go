@@ -55,6 +55,8 @@ func main() {
 		"Merkle service listen address")
 	flag.StringVar(&cfg.CallbackAddr, "callback-addr", cfg.CallbackAddr,
 		"Callback server listen address")
+	flag.StringVar(&cfg.DumpBUMPFile, "dump-bump", cfg.DumpBUMPFile,
+		"If set, write the first assembled BUMP as a hex string to this file")
 	flag.Parse()
 
 	// Validate

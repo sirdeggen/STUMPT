@@ -3,9 +3,11 @@ package merkleservice
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"sort"
 	"time"
 
@@ -16,7 +18,8 @@ import (
 )
 
 // processBUMPs is the entry-point for block-finalization BUMP work.
-// It builds compound BUMPs for all 100 tokens and delivers them via HTTP.
+// It builds compound BUMPs for all tokens and delivers them via HTTP.
+// If dumpFile is non-empty the first assembled BUMP is written as a hex string.
 func processBUMPs(
 	ctx context.Context,
 	blockHeight uint32,
@@ -24,6 +27,7 @@ func processBUMPs(
 	mc *metrics.Collector,
 	evt *BlockFinalizedEvent,
 	callbackAddr string,
+	dumpFile string,
 ) {
 	t0 := time.Now()
 
@@ -67,7 +71,13 @@ func processBUMPs(
 			continue
 		}
 
-		results = append(results, result{token: token, cb: cb, data: bump.Bytes()})
+		bumpBytes := bump.Bytes()
+		results = append(results, result{token: token, cb: cb, data: bumpBytes})
+
+		// Dump the first BUMP to file as hex if requested.
+		if dumpFile != "" && len(results) == 1 {
+			dumpBUMPHex(dumpFile, token, bumpBytes)
+		}
 
 		// Log progress every 10% for large token counts.
 		if done := len(results); total >= 10 && done%(total/10) == 0 {
@@ -228,6 +238,21 @@ func deliverBUMP(
 		"bytes", len(data),
 		"httpMs", time.Since(t0).Milliseconds(),
 		"blockLatency", latency,
+	)
+}
+
+// dumpBUMPHex writes the BUMP binary as a UTF-8 hex string to path.
+// The file contains exactly one line: the lowercase hex-encoded BUMP bytes.
+func dumpBUMPHex(path, token string, data []byte) {
+	if err := os.WriteFile(path, []byte(hex.EncodeToString(data)), 0o644); err != nil {
+		slog.Error("dump-bump: write failed", "path", path, "err", err)
+		return
+	}
+	slog.Info("dump-bump: wrote BUMP hex",
+		"path", path,
+		"token", token,
+		"bytes", len(data),
+		"hexLen", len(data)*2,
 	)
 }
 

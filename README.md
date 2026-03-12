@@ -140,6 +140,7 @@ This runs 61 440 txids (60 subtrees × 1 024) at ~102.4 txids/sec over 10 minute
 -duration           duration Total test duration                (default 10s)
 -merkle-addr        string   Merkle service listen address      (default :18080)
 -callback-addr      string   Callback server listen address     (default :13000)
+-dump-bump          string   Write first assembled BUMP as hex to this file (optional)
 ```
 
 `hashes-per-block` must be divisible by `hashes-per-subtree`.

@@ -27,6 +27,10 @@ type Config struct {
 	// JitterPercent defines the fraction of adjacent pairs swapped per miner.
 	// len must equal NumMiners; index 0 is always 0.0 (canonical order).
 	JitterPercent []float64
+
+	// DumpBUMPFile is an optional file path.  When non-empty the first
+	// assembled compound BUMP is written as a UTF-8 hex string to this file.
+	DumpBUMPFile string
 }
 
 // Default returns a Config with the standard test parameters.
