@@ -42,6 +42,8 @@ type BlockFinalizedEvent struct {
 	TokenSubtreeIdx *TokenSubtreeIndex
 	// MinerSubStore provides disk-backed loading of subtree data.
 	MinerSubStore *diskstore.MinerSubtreeStore
+	// FragStore provides pre-computed STUMP fragments from Phase 2.
+	FragStore *diskstore.FragmentStore
 	// HashesPerSubtree is needed to compute GlobalIdx from (subtreeIdx, localIdx).
 	HashesPerSubtree int
 	// NumBusinesses is the total number of business tokens.

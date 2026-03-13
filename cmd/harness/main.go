@@ -216,7 +216,8 @@ func run(cfg *config.Config, mc *metrics.Collector) {
 		minerTokenIdx[i] = merkleservice.NewTokenSubtreeIndex()
 	}
 
-	minerRoots := merkleservice.SealSubtreesToDisk(txids, cfg, db, mc, minerTokenIdx)
+	fragStore := diskstore.NewFragmentStore(db)
+	minerRoots := merkleservice.SealSubtreesToDisk(txids, cfg, db, mc, minerTokenIdx, fragStore)
 
 	phase2Dur := time.Since(t2)
 	mc.RecordPhase2(phase2Dur)
@@ -240,7 +241,7 @@ func run(cfg *config.Config, mc *metrics.Collector) {
 	t4 := time.Now()
 
 	// Finalize: pick winner, coinbase reseal.
-	evt := merkleservice.FinalizeBlock(cfg, mc, db, minerRoots, minerTokenIdx, firstTxid)
+	evt := merkleservice.FinalizeBlock(cfg, mc, db, minerRoots, minerTokenIdx, firstTxid, fragStore)
 	if evt == nil {
 		slog.Error("block finalization failed")
 		os.Exit(1)

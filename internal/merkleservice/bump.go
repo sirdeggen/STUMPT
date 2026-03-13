@@ -138,6 +138,277 @@ func bitsetCheck(bs []uint64, pos int) bool {
 	return false
 }
 
+// extractSubtreeFragment computes the subtree-level BUMP entries (levels 0..subtreeHeight-1)
+// for a single token's txids in a single subtree. Used during Phase 2 sealing when
+// leaves and store are already in memory. Returns per-level bumpEntry slices with
+// hash bytes copied (not pointers, since the source data will be freed).
+func extractSubtreeFragment(
+	leaves []chainhash.Hash,
+	store []chainhash.Hash,
+	localIdxs []int32,
+	subtreeIdx int,
+	hashesPerSubtree int,
+	subtreeHeight int,
+	ws *workerState,
+) [][]bumpEntry {
+	nLeaves := len(leaves)
+	pad := subtree.NextPowerOfTwo(nLeaves)
+
+	// Sort local indices for consistent output order.
+	sortedIdxs := make([]int, len(localIdxs))
+	for i, li := range localIdxs {
+		sortedIdxs[i] = int(li)
+	}
+	sort.Ints(sortedIdxs)
+
+	// Ensure we have enough levels in ws.
+	for len(ws.levels) < subtreeHeight {
+		ws.levels = append(ws.levels, nil)
+	}
+	for k := 0; k < subtreeHeight; k++ {
+		ws.levels[k] = ws.levels[k][:0]
+	}
+
+	// ── Level 0: txid + sibling entries ─────────────────────────────────
+	bsWords0 := (pad/2 + 63) / 64
+	bs0 := ws.ensureBitset(bsWords0)
+
+	for _, li := range sortedIdxs {
+		g := uint64(subtreeIdx*hashesPerSubtree + li) //nolint:gosec
+
+		// Txid entry — always emitted.
+		ws.levels[0] = append(ws.levels[0], bumpEntry{
+			offset: g,
+			hash:   &leaves[li],
+			txid:   true,
+		})
+
+		// Sibling — emit only once per pair.
+		pairLocal := li >> 1
+		if !bitsetCheck(bs0, pairLocal) {
+			sibLi := li ^ 1
+			if sibLi >= nLeaves {
+				sibLi = li
+			}
+			ws.levels[0] = append(ws.levels[0], bumpEntry{
+				offset: g ^ 1,
+				hash:   &leaves[sibLi],
+			})
+		}
+	}
+
+	// ── Subtree levels 1..subtreeHeight-1 ───────────────────────────────
+	storeOff := 0
+	storeSize := pad / 2
+	for k := 1; k < subtreeHeight; k++ {
+		bsWordsK := (storeSize + 63) / 64
+		bsK := ws.ensureBitset(bsWordsK)
+
+		for _, li := range sortedIdxs {
+			g := uint64(subtreeIdx*hashesPerSubtree + li) //nolint:gosec
+
+			sibLocalK := (li >> k) ^ 1
+			if sibLocalK >= storeSize {
+				sibLocalK = storeSize - 1
+			}
+
+			if !bitsetCheck(bsK, sibLocalK) {
+				sibGlobalK := (g >> k) ^ 1
+				ws.levels[k] = append(ws.levels[k], bumpEntry{
+					offset: sibGlobalK,
+					hash:   &store[storeOff+sibLocalK],
+				})
+			}
+		}
+
+		storeOff += storeSize
+		storeSize /= 2
+	}
+
+	// Sort each level by offset.
+	for k := 0; k < subtreeHeight; k++ {
+		lev := ws.levels[k]
+		if len(lev) > 1 {
+			sort.Slice(lev, func(i, j int) bool { return lev[i].offset < lev[j].offset })
+		}
+	}
+
+	// Copy into owned slices (source data will be freed after Phase 2).
+	result := make([][]bumpEntry, subtreeHeight)
+	for k := 0; k < subtreeHeight; k++ {
+		result[k] = make([]bumpEntry, len(ws.levels[k]))
+		copy(result[k], ws.levels[k])
+	}
+	return result
+}
+
+// MarshalFragment encodes per-level bumpEntry slices into a flat byte buffer.
+// Format: [1B numLevels] per level: [4B LE numEntries] per entry: [8B LE offset][1B flags][32B hash]
+func MarshalFragment(levels [][]bumpEntry) []byte {
+	// Calculate total size.
+	size := 1 // numLevels
+	for _, lev := range levels {
+		size += 4 + len(lev)*41 // 4B count + entries
+	}
+
+	buf := make([]byte, size)
+	off := 0
+	buf[off] = byte(len(levels))
+	off++
+
+	for _, lev := range levels {
+		binary.LittleEndian.PutUint32(buf[off:], uint32(len(lev)))
+		off += 4
+		for _, e := range lev {
+			binary.LittleEndian.PutUint64(buf[off:], e.offset)
+			off += 8
+			if e.txid {
+				buf[off] = 2 // bit 1 = txid
+			} else {
+				buf[off] = 0
+			}
+			off++
+			copy(buf[off:], e.hash[:])
+			off += 32
+		}
+	}
+	return buf
+}
+
+// UnmarshalFragment decodes a fragment into per-level bumpEntry slices.
+// The hash fields point into newly allocated chainhash.Hash values.
+func UnmarshalFragment(data []byte) ([][]bumpEntry, error) {
+	if len(data) < 1 {
+		return nil, fmt.Errorf("fragment too short")
+	}
+
+	numLevels := int(data[0])
+	off := 1
+	levels := make([][]bumpEntry, numLevels)
+
+	for k := 0; k < numLevels; k++ {
+		if off+4 > len(data) {
+			return nil, fmt.Errorf("fragment truncated at level %d header", k)
+		}
+		n := int(binary.LittleEndian.Uint32(data[off:]))
+		off += 4
+
+		need := n * 41
+		if off+need > len(data) {
+			return nil, fmt.Errorf("fragment truncated at level %d entries", k)
+		}
+
+		entries := make([]bumpEntry, n)
+		// Allocate all hashes in one block for cache locality.
+		hashes := make([]chainhash.Hash, n)
+		for i := 0; i < n; i++ {
+			entries[i].offset = binary.LittleEndian.Uint64(data[off:])
+			off += 8
+			entries[i].txid = data[off]&2 != 0
+			off++
+			copy(hashes[i][:], data[off:off+32])
+			entries[i].hash = &hashes[i]
+			off += 32
+		}
+		levels[k] = entries
+	}
+	return levels, nil
+}
+
+// assembleTokenBUMPFromFragments builds a BUMP from pre-computed STUMP fragments.
+// No full subtree loads or merkle store walks — just fragment deserialization,
+// top-tree addition, pruning, and serialization.
+func assembleTokenBUMPFromFragments(
+	blockHeight uint32,
+	fragmentData [][]byte, // one per subtree the token spans
+	subtreeIdxs []int,     // corresponding subtree indices
+	topProofs [][]*chainhash.Hash,
+	subtreeHeight, topTreeHeight, totalHeight int,
+	hashesPerSubtree int,
+	ws *workerState,
+) ([]byte, error) {
+	if len(fragmentData) == 0 {
+		return nil, fmt.Errorf("assembleTokenBUMPFromFragments: no fragments")
+	}
+
+	ws.reset(totalHeight)
+
+	// ── Load and concatenate subtree-level entries from fragments ────────
+	for _, frag := range fragmentData {
+		levels, err := UnmarshalFragment(frag)
+		if err != nil {
+			return nil, fmt.Errorf("fragment unmarshal: %w", err)
+		}
+		for k := 0; k < len(levels) && k < subtreeHeight; k++ {
+			ws.levels[k] = append(ws.levels[k], levels[k]...)
+		}
+	}
+
+	// ── Top-tree levels: tiny map for dedup ─────────────────────────────
+	// We need globalIdx values to compute top-tree offsets. Extract them from
+	// the level-0 txid entries (which have the correct global offsets).
+	for k := 0; k < topTreeHeight; k++ {
+		blockLevel := subtreeHeight + k
+		seen := make(map[uint64]struct{}, 256)
+
+		for _, e := range ws.levels[0] {
+			if !e.txid {
+				continue
+			}
+			g := e.offset // level-0 txid offset IS the global leaf index
+			sibOff := (g >> blockLevel) ^ 1
+			if _, exists := seen[sibOff]; !exists {
+				seen[sibOff] = struct{}{}
+				// Determine which subtree this txid belongs to.
+				si := int(g) / hashesPerSubtree
+				tp := topProofs[si]
+				ws.levels[blockLevel] = append(ws.levels[blockLevel], bumpEntry{
+					offset: sibOff,
+					hash:   tp[k],
+				})
+			}
+		}
+	}
+
+	// ── Sort each level by offset ───────────────────────────────────────
+	for h := 0; h < totalHeight; h++ {
+		lev := ws.levels[h]
+		if len(lev) > 1 {
+			sort.Slice(lev, func(i, j int) bool { return lev[i].offset < lev[j].offset })
+		}
+	}
+
+	// ── Prune: skip level-h entry if both children present at h-1 ───────
+	offsetSets := make([]map[uint64]struct{}, totalHeight)
+	for h := 0; h < totalHeight; h++ {
+		m := make(map[uint64]struct{}, len(ws.levels[h]))
+		for _, e := range ws.levels[h] {
+			m[e.offset] = struct{}{}
+		}
+		offsetSets[h] = m
+	}
+
+	for h := totalHeight - 1; h > 0; h-- {
+		childSet := offsetSets[h-1]
+		pruned := ws.levels[h][:0]
+		for _, e := range ws.levels[h] {
+			childL := e.offset * 2
+			childR := e.offset*2 + 1
+			_, hasL := childSet[childL]
+			_, hasR := childSet[childR]
+			if hasL && hasR {
+				delete(offsetSets[h], e.offset)
+				continue
+			}
+			pruned = append(pruned, e)
+		}
+		ws.levels[h] = pruned
+	}
+
+	// ── Serialize BUMP binary ───────────────────────────────────────────
+	return serializeBUMP(blockHeight, ws.levels[:totalHeight], &ws.outBuf), nil
+}
+
 // assembleTokenBUMPFast builds a BUMP using bitset dedup within subtrees
 // and flat sorted slice concatenation across subtrees. Returns serialized
 // BUMP binary directly — no go-sdk MerklePath intermediary.
@@ -412,113 +683,181 @@ func ProcessBUMPs(
 		numWorkers = 1
 	}
 
+	useFragments := evt.FragStore != nil
 	slog.Info("BUMP assembly starting",
 		"tokens", total,
 		"workers", numWorkers,
 		"cacheSize", maxCacheEntries,
+		"fragments", useFragments,
 	)
-
-	// Disk-backed subtree loading with bounded cache.
-	cache := newSubtreeCache(maxCacheEntries, mc)
-
-	loadSubtree := func(si int) *cachedSubtree {
-		if cs := cache.get(si); cs != nil {
-			return cs
-		}
-		mc.RecordCacheMiss()
-		tRead := time.Now()
-		leavesBytes, storeBytes, ok := evt.MinerSubStore.Load(evt.WinnerMiner, si)
-		mc.RecordDiskRead(time.Since(tRead))
-		if !ok {
-			slog.Error("subtree load failed", "miner", evt.WinnerMiner, "subtree", si)
-			return nil
-		}
-		cs := &cachedSubtree{
-			Leaves: bytesToHashSlice(leavesBytes),
-			Store:  bytesToHashSlice(storeBytes),
-		}
-		cache.put(si, cs)
-		return cs
-	}
 
 	// Worker pool for BUMP assembly.
 	workCh := make(chan int, total)
 	var wg sync.WaitGroup
 	var dumpOnce sync.Once
 
-	for w := 0; w < numWorkers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	if useFragments {
+		// ── Fragment-based path: load pre-computed STUMP fragments ───────
+		for w := 0; w < numWorkers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
 
-			// Per-worker reusable state — eliminates GC pressure.
-			ws := newWorkerState(totalHeight)
-			var positions []leafPos
-			subtreeMap := make(map[int]*cachedSubtree)
+				ws := newWorkerState(totalHeight)
+				var fragmentData [][]byte
+				var subtreeIdxList []int
 
-			for idx := range workCh {
-				token := tokens[idx]
+				for idx := range workCh {
+					token := tokens[idx]
 
-				subtreeIdxs := evt.TokenSubtreeIdx.SubtreeIndices(token)
-				if len(subtreeIdxs) == 0 {
-					continue
-				}
-
-				// Collect positions and load subtrees (no proof extraction).
-				positions = positions[:0]
-				for k := range subtreeMap {
-					delete(subtreeMap, k)
-				}
-
-				for _, si := range subtreeIdxs {
-					localIdxs := evt.TokenSubtreeIdx.Get(token, si)
-					if len(localIdxs) == 0 {
+					subtreeIdxs := evt.TokenSubtreeIdx.SubtreeIndices(token)
+					if len(subtreeIdxs) == 0 {
 						continue
 					}
-					sc := loadSubtree(si)
-					if sc == nil {
+
+					// Load pre-computed fragments for each subtree.
+					fragmentData = fragmentData[:0]
+					subtreeIdxList = subtreeIdxList[:0]
+					for _, si := range subtreeIdxs {
+						tRead := time.Now()
+						data, ok := evt.FragStore.Load(evt.WinnerMiner, idx, si)
+						mc.RecordDiskRead(time.Since(tRead))
+						if !ok {
+							mc.RecordCacheMiss()
+							continue
+						}
+						mc.RecordCacheHit()
+						fragmentData = append(fragmentData, data)
+						subtreeIdxList = append(subtreeIdxList, si)
+					}
+					if len(fragmentData) == 0 {
 						continue
 					}
-					subtreeMap[si] = sc
-					for _, li32 := range localIdxs {
-						positions = append(positions, leafPos{
-							subtreeIdx: si,
-							localIdx:   int(li32),
-							globalIdx:  si*evt.HashesPerSubtree + int(li32),
+
+					bumpBytes, err := assembleTokenBUMPFromFragments(
+						blockHeight, fragmentData, subtreeIdxList, topProofs,
+						subtreeHeight, topTreeHeight, totalHeight,
+						evt.HashesPerSubtree, ws,
+					)
+					if err != nil {
+						slog.Error("BUMP build failed", "token", token, "err", err)
+						continue
+					}
+					mc.RecordBUMP(len(bumpBytes))
+
+					if dumpFile != "" {
+						dumpOnce.Do(func() {
+							dumpBUMPHex(dumpFile, token, bumpBytes)
 						})
 					}
-				}
-				if len(positions) == 0 {
-					continue
-				}
 
-				bumpBytes, err := assembleTokenBUMPFast(
-					blockHeight, positions, subtreeMap, topProofs,
-					subtreeHeight, topTreeHeight, totalHeight,
-					ws,
-				)
-				if err != nil {
-					slog.Error("BUMP build failed", "token", token, "err", err)
-					continue
+					count := mc.BUMPCount()
+					if total >= 10 && count%(int64(total)/10) == 0 {
+						slog.Info("BUMP assembly progress",
+							"done", count,
+							"total", total,
+							"elapsed", time.Since(t1).Round(time.Millisecond),
+						)
+					}
 				}
-				mc.RecordBUMP(len(bumpBytes))
+			}()
+		}
+	} else {
+		// ── Fallback: JIT path (load full subtrees, walk merkle store) ──
+		cache := newSubtreeCache(maxCacheEntries, mc)
 
-				if dumpFile != "" {
-					dumpOnce.Do(func() {
-						dumpBUMPHex(dumpFile, token, bumpBytes)
-					})
-				}
-
-				count := mc.BUMPCount()
-				if total >= 10 && count%(int64(total)/10) == 0 {
-					slog.Info("BUMP assembly progress",
-						"done", count,
-						"total", total,
-						"elapsed", time.Since(t1).Round(time.Millisecond),
-					)
-				}
+		loadSubtree := func(si int) *cachedSubtree {
+			if cs := cache.get(si); cs != nil {
+				return cs
 			}
-		}()
+			mc.RecordCacheMiss()
+			tRead := time.Now()
+			leavesBytes, storeBytes, ok := evt.MinerSubStore.Load(evt.WinnerMiner, si)
+			mc.RecordDiskRead(time.Since(tRead))
+			if !ok {
+				slog.Error("subtree load failed", "miner", evt.WinnerMiner, "subtree", si)
+				return nil
+			}
+			cs := &cachedSubtree{
+				Leaves: bytesToHashSlice(leavesBytes),
+				Store:  bytesToHashSlice(storeBytes),
+			}
+			cache.put(si, cs)
+			return cs
+		}
+
+		for w := 0; w < numWorkers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+
+				ws := newWorkerState(totalHeight)
+				var positions []leafPos
+				subtreeMap := make(map[int]*cachedSubtree)
+
+				for idx := range workCh {
+					token := tokens[idx]
+
+					subtreeIdxs := evt.TokenSubtreeIdx.SubtreeIndices(token)
+					if len(subtreeIdxs) == 0 {
+						continue
+					}
+
+					positions = positions[:0]
+					for k := range subtreeMap {
+						delete(subtreeMap, k)
+					}
+
+					for _, si := range subtreeIdxs {
+						localIdxs := evt.TokenSubtreeIdx.Get(token, si)
+						if len(localIdxs) == 0 {
+							continue
+						}
+						sc := loadSubtree(si)
+						if sc == nil {
+							continue
+						}
+						subtreeMap[si] = sc
+						for _, li32 := range localIdxs {
+							positions = append(positions, leafPos{
+								subtreeIdx: si,
+								localIdx:   int(li32),
+								globalIdx:  si*evt.HashesPerSubtree + int(li32),
+							})
+						}
+					}
+					if len(positions) == 0 {
+						continue
+					}
+
+					bumpBytes, err := assembleTokenBUMPFast(
+						blockHeight, positions, subtreeMap, topProofs,
+						subtreeHeight, topTreeHeight, totalHeight,
+						ws,
+					)
+					if err != nil {
+						slog.Error("BUMP build failed", "token", token, "err", err)
+						continue
+					}
+					mc.RecordBUMP(len(bumpBytes))
+
+					if dumpFile != "" {
+						dumpOnce.Do(func() {
+							dumpBUMPHex(dumpFile, token, bumpBytes)
+						})
+					}
+
+					count := mc.BUMPCount()
+					if total >= 10 && count%(int64(total)/10) == 0 {
+						slog.Info("BUMP assembly progress",
+							"done", count,
+							"total", total,
+							"elapsed", time.Since(t1).Round(time.Millisecond),
+						)
+					}
+				}
+			}()
+		}
 	}
 
 	for i := range tokens {

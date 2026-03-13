@@ -29,9 +29,11 @@ func SealSubtreesToDisk(
 	db *diskstore.DB,
 	mc *metrics.Collector,
 	minerTokenIdx []*TokenSubtreeIndex,
+	fragStore *diskstore.FragmentStore,
 ) [][]chainhash.Hash {
 	numSubtrees := cfg.NumSubtrees()
 	minerSubStore := diskstore.NewMinerSubtreeStore(db)
+	subtreeHeight := subtree.Log2Ceil(cfg.HashesPerSubtree)
 
 	// Per-miner roots.
 	roots := make([][]chainhash.Hash, cfg.NumMiners)
@@ -84,7 +86,7 @@ func SealSubtreesToDisk(
 		}
 		mc.RecordDiskWrite(time.Since(tDisk))
 
-		// Index token→leaf positions for every miner.
+		// Index token→leaf positions and extract STUMP fragments for every miner.
 		tIdx := time.Now()
 		for m := 0; m < cfg.NumMiners; m++ {
 			ms := minerSubs[m]
@@ -95,19 +97,45 @@ func SealSubtreesToDisk(
 				localIdx[h] = i
 			}
 
-			// For each leaf in canonical order, derive token from global index.
-			tokenLocalIdxs := make(map[string][]int32)
-			for i, txid := range base {
-				globalIdx := start + i
-				token := fmt.Sprintf("token-%d", globalIdx%cfg.NumBusinesses)
+			// For each leaf in canonical order, derive token from txid hash.
+			// Using the txid itself (crypto-random) gives uniform, order-independent
+			// token assignment — realistic unlike round-robin from arrival index.
+			type tokenIdxPair struct {
+				name string
+				idx  int
+			}
+			tokenLocalIdxs := make(map[int][]int32)  // tokenIdx → []localIdx
+			tokenNames := make(map[int]string)        // tokenIdx → "token-N"
+			for _, txid := range base {
+				ti := int(binary.LittleEndian.Uint64(txid[:8]) % uint64(cfg.NumBusinesses))
+				if _, ok := tokenNames[ti]; !ok {
+					tokenNames[ti] = fmt.Sprintf("token-%d", ti)
+				}
 				li, ok := localIdx[txid]
 				if !ok {
 					continue
 				}
-				tokenLocalIdxs[token] = append(tokenLocalIdxs[token], int32(li))
+				tokenLocalIdxs[ti] = append(tokenLocalIdxs[ti], int32(li))
 			}
-			for tok, idxs := range tokenLocalIdxs {
-				minerTokenIdx[m].AddBatch(tok, si, idxs)
+			for ti, idxs := range tokenLocalIdxs {
+				minerTokenIdx[m].AddBatch(tokenNames[ti], si, idxs)
+			}
+
+			// Extract and store STUMP fragments (subtree-level BUMP entries).
+			// The merkle store is in memory now — this avoids re-loading it at Phase 4.
+			if fragStore != nil {
+				ws := newWorkerState(subtreeHeight)
+				fragments := make(map[int][]byte, len(tokenLocalIdxs))
+				for ti, idxs := range tokenLocalIdxs {
+					levels := extractSubtreeFragment(
+						ms.Leaves, ms.Store, idxs,
+						si, cfg.HashesPerSubtree, subtreeHeight, ws,
+					)
+					fragments[ti] = MarshalFragment(levels)
+				}
+				if err := fragStore.SaveBatch(m, si, fragments); err != nil {
+					slog.Error("fragment write failed", "miner", m, "subtree", si, "err", err)
+				}
 			}
 		}
 		mc.RecordProofCompute(time.Since(tIdx))
@@ -139,6 +167,7 @@ func FinalizeBlock(
 	minerRoots [][]chainhash.Hash,
 	minerTokenIdx []*TokenSubtreeIndex,
 	firstTxid chainhash.Hash,
+	fragStore *diskstore.FragmentStore,
 ) *BlockFinalizedEvent {
 	t0 := time.Now()
 	minerSubStore := diskstore.NewMinerSubtreeStore(db)
@@ -196,6 +225,36 @@ func FinalizeBlock(
 		slog.Error("coinbase: failed to save resealed subtree-0", "err", err)
 	}
 
+	// Re-extract STUMP fragments for subtree-0 (invalidated by coinbase change).
+	if fragStore != nil {
+		subtreeHeight := subtree.Log2Ceil(cfg.HashesPerSubtree)
+		ws := newWorkerState(subtreeHeight)
+		winnerIdx := minerTokenIdx[winner]
+
+		// Find all tokens that have txids in subtree-0.
+		fragments := make(map[int][]byte)
+		for _, token := range winnerIdx.Tokens() {
+			localIdxs := winnerIdx.Get(token, 0)
+			if len(localIdxs) == 0 {
+				continue
+			}
+			// Parse tokenIdx from "token-N" string.
+			var ti int
+			fmt.Sscanf(token, "token-%d", &ti)
+			levels := extractSubtreeFragment(
+				leaves, newStore, localIdxs,
+				0, cfg.HashesPerSubtree, subtreeHeight, ws,
+			)
+			fragments[ti] = MarshalFragment(levels)
+		}
+		if err := fragStore.SaveBatch(winner, 0, fragments); err != nil {
+			slog.Error("coinbase: fragment re-extraction failed", "err", err)
+		}
+		slog.Info("coinbase: re-extracted subtree-0 fragments",
+			"tokens", len(fragments),
+		)
+	}
+
 	coinbaseDur := time.Since(t0)
 	mc.RecordCoinbaseReseal(coinbaseDur)
 	slog.Info("coinbase reseal complete", "miner", winner, "duration", coinbaseDur)
@@ -205,6 +264,7 @@ func FinalizeBlock(
 		SubtreeRoots:     minerRoots[winner],
 		TokenSubtreeIdx:  minerTokenIdx[winner],
 		MinerSubStore:    minerSubStore,
+		FragStore:        fragStore,
 		HashesPerSubtree: cfg.HashesPerSubtree,
 		NumBusinesses:    cfg.NumBusinesses,
 	}

@@ -188,6 +188,86 @@ func TestFastVsLegacyBUMP(t *testing.T) {
 	}
 }
 
+// TestFragmentVsJIT verifies that the fragment-based path produces
+// byte-identical BUMP output to the JIT path (assembleTokenBUMPFast).
+func TestFragmentVsJIT(t *testing.T) {
+	tests := []struct {
+		name      string
+		numST     int
+		stSize    int
+		numProofs int
+	}{
+		{"4st_16leaf_8proof", 4, 16, 8},
+		{"8st_64leaf_40proof", 8, 64, 40},
+		{"16st_128leaf_100proof", 16, 128, 100},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			positions, subtreeMap, topProofs, sh, tth, th := setupFastBenchmark(tc.numST, tc.stSize, tc.numProofs)
+
+			// JIT path.
+			wsJIT := newWorkerState(th)
+			jitBytes, err := assembleTokenBUMPFast(
+				800_000, positions, subtreeMap, topProofs, sh, tth, th, wsJIT,
+			)
+			if err != nil {
+				t.Fatalf("JIT failed: %v", err)
+			}
+
+			// Fragment path: extract fragments per subtree, then assemble.
+			wsExtract := newWorkerState(sh)
+
+			// Group positions by subtree to extract fragments.
+			subtreeLocalIdxs := make(map[int][]int32)
+			for _, pos := range positions {
+				subtreeLocalIdxs[pos.subtreeIdx] = append(
+					subtreeLocalIdxs[pos.subtreeIdx], int32(pos.localIdx),
+				)
+			}
+
+			var fragmentData [][]byte
+			var subtreeIdxList []int
+			for si := 0; si < tc.numST; si++ {
+				idxs, ok := subtreeLocalIdxs[si]
+				if !ok {
+					continue
+				}
+				sc := subtreeMap[si]
+				levels := extractSubtreeFragment(
+					sc.Leaves, sc.Store, idxs,
+					si, tc.stSize, sh, wsExtract,
+				)
+				fragmentData = append(fragmentData, MarshalFragment(levels))
+				subtreeIdxList = append(subtreeIdxList, si)
+			}
+
+			wsFrag := newWorkerState(th)
+			fragBytes, err := assembleTokenBUMPFromFragments(
+				800_000, fragmentData, subtreeIdxList, topProofs,
+				sh, tth, th, tc.stSize, wsFrag,
+			)
+			if err != nil {
+				t.Fatalf("fragment path failed: %v", err)
+			}
+
+			if !bytes.Equal(jitBytes, fragBytes) {
+				t.Errorf("BUMP bytes differ: JIT=%d bytes, fragment=%d bytes", len(jitBytes), len(fragBytes))
+				minLen := len(jitBytes)
+				if len(fragBytes) < minLen {
+					minLen = len(fragBytes)
+				}
+				for i := 0; i < minLen; i++ {
+					if jitBytes[i] != fragBytes[i] {
+						t.Errorf("first diff at byte %d: JIT=0x%02x frag=0x%02x", i, jitBytes[i], fragBytes[i])
+						break
+					}
+				}
+			}
+		})
+	}
+}
+
 // BenchmarkAssembleTokenBUMPFast benchmarks the new fast path.
 func BenchmarkAssembleTokenBUMPFast(b *testing.B) {
 	configs := []struct {
