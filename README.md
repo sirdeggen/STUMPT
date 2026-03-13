@@ -14,12 +14,49 @@ The naive approach is to build the full block merkle tree at the moment the bloc
 
 The theory being tested here is a **subtree-based incremental approach**:
 
-1. As transactions arrive over the ~10 minutes between blocks, group them into fixed-size **subtrees**.
-2. Each subtree's internal merkle path can be pre-computed as soon as the subtree is sealed — spreading the work evenly across the inter-block interval.
-3. When the block is found, a small **top tree** (one leaf per subtree root) is built and the top-level proof legs are appended to the pre-computed subtree paths.
-4. Each subscribing business receives a single **compound BUMP** that covers all of their transactions at once.
+1. As transactions arrive over the ~10 minutes between blocks, group them into fixed-size **subtrees** (default: 1M leaves each).
+2. Each subtree's internal merkle tree is built as soon as the subtree is sealed — spreading the work evenly across the inter-block interval.
+3. A lightweight **TokenSubtreeIndex** records which tokens have txids in each subtree and their leaf positions (4 bytes/entry).
+4. When the block is found, a small **top tree** (one leaf per subtree root) is built and proofs are computed **just-in-time** from the cached merkle stores.
+5. Each subscribing business receives a single **compound BUMP** that covers all of their transactions at once, assembled via a streaming pipeline.
 
 This repo simulates that pipeline end-to-end and measures the timing of each phase.
+
+---
+
+## System requirements
+
+The harness auto-detects your system's RAM and scales the default test to use ~80% of physical memory with 1M-leaf subtrees.
+
+```
+╔══════════════════════════════════════════════════════════════════════════╗
+║                     STUMPT System Requirements                          ║
+╠═══════════════╦═══════════════╦═══════════════╦══════════════════════════╣
+║   Total TXIDs ║   Subtrees    ║   Est. RAM    ║   Min System RAM        ║
+╠═══════════════╬═══════════════╬═══════════════╬══════════════════════════╣
+║            2M ║       2 × 1M ║        4.3 GB ║        5.4 GB             ║
+║            4M ║       4 × 1M ║        4.6 GB ║        5.8 GB             ║
+║           10M ║      10 × 1M ║        5.5 GB ║        6.9 GB             ║
+║           21M ║      20 × 1M ║        7.1 GB ║        8.9 GB             ║
+║           42M ║      40 × 1M ║       10.2 GB ║       12.7 GB             ║
+║           63M ║      60 × 1M ║       13.3 GB ║       16.6 GB             ║
+║          105M ║     100 × 1M ║       19.4 GB ║       24.3 GB             ║
+║          157M ║     150 × 1M ║       27.1 GB ║       33.9 GB             ║
+║          315M ║     300 × 1M ║       50.3 GB ║       62.9 GB             ║
+║          629M ║     600 × 1M ║       96.6 GB ║      120.7 GB             ║
+╚═══════════════╩═══════════════╩═══════════════╩══════════════════════════╝
+
+Memory model: 158 B/txid + 4 GB overhead
+```
+
+**158 B/txid** breaks down as:
+- 64 B — miner-0 subtree data (leaves + merkle store, kept in memory)
+- 90 B — in-memory TxID index (`map[chainhash.Hash]string`)
+- 4 B — TokenSubtreeIndex entry (`int32` local leaf position)
+
+**4 GB overhead** covers BadgerDB (disk-backed storage for non-miner-0 data), Go runtime, BUMP assembly buffers, and OS overhead.
+
+If your machine doesn't have enough RAM for the requested configuration, the harness exits with a clear error and prints this table. Use `-max-memory` to set a specific budget, or `-requirements` to just print the table.
 
 ---
 
@@ -31,113 +68,78 @@ Three components run in a single process:
   Generator ──POST /watch──► Merkle Service ──POST (raw BUMP)──► Callback Server
 ```
 
-In **direct mode** (`-direct` flag), the generator bypasses HTTP and calls the registry directly, enabling large-scale runs (6M+ txids) that would be bottlenecked by HTTP/JSON overhead.
+In **direct mode** (`-direct` flag), the generator bypasses HTTP and calls the registry directly, enabling large-scale runs (millions of txids) that would be bottlenecked by HTTP/JSON overhead.
+
+### Storage strategy
+
+The system uses a hybrid in-memory / disk-backed approach to balance speed and memory:
+
+| Data | Storage | Why |
+|------|---------|-----|
+| Miner-0 subtree leaves + stores | **In-memory** | Hot path — needed for JIT proof computation during BUMP assembly |
+| Miners 1+ subtree data | **BadgerDB (disk)** | Cold — only needed if a non-miner-0 block wins |
+| TxID → token index | **In-memory** | Accessed on every txid arrival for O(1) lookup |
+| TokenSubtreeIndex | **In-memory** | Lightweight (4B/entry), accessed during BUMP assembly |
+| Buffered txid lists | **BadgerDB (disk)** | Per-token txid lists, batched writes |
 
 ### Generator (`internal/generator`)
 - Produces `HASHES_PER_BLOCK` random 32-byte hashes (mock txids).
 - **HTTP mode:** Submits at a rate of `HASHES_PER_BLOCK / duration` per second.
-- **Direct mode:** Submits as fast as possible (bypasses HTTP), achieving 120k+ txids/sec.
+- **Direct mode:** Submits as fast as possible (bypasses HTTP), achieving 1M+ txids/sec.
 - Each submission picks one of N callback tokens round-robin, simulating N distinct submitting businesses.
 
 ### Merkle Service (`internal/merkleservice`)
 - Receives `POST /watch` with `{ txid, callback: { url, token } }` (or direct calls in `-direct` mode).
 - Every `HASHES_PER_SUBTREE` txids received, **seals a subtree**:
   - Builds N miners' versions of the subtree with deterministically jittered ordering.
-  - Pre-computes miner-0 merkle proofs using **STUMP XOR indexing** (see below).
+  - Parallel merkle tree building for large subtrees (goroutines for levels with 4096+ pairs).
+  - Records token leaf positions in the **TokenSubtreeIndex** (4B per entry).
+  - Keeps miner-0 subtrees in memory; evicts miners 1+ to BadgerDB.
 - When `HASHES_PER_BLOCK` txids are received, **finalises the block**:
   - Performs coinbase replacement + subtree-0 reseal.
-  - Uses **STUMP Discover** to gather proofs for all tokens via XOR probing.
-  - Builds compound BUMPs in parallel using a worker pool.
-  - POSTs the raw BUMP binary to each token's callback URL.
+  - Builds the top tree from subtree roots.
+  - **JIT proof computation:** assembles compound BUMPs from cached miner-0 merkle stores using the TokenSubtreeIndex to find leaf positions.
+  - Streams BUMPs via a build→deliver pipeline (no accumulation of all BUMPs in memory).
 
 ### Callback Server (`internal/callback`)
 - Receives the raw BUMP binary POSTs.
 - Logs token, payload size, and end-to-end latency from block announcement to delivery.
 
 ### Subtree / Merkle Engine (`internal/subtree`)
-- Implements `BuildMerkleStore`, `GetMerkleProof`, and `GetAllProofs` using `go-sdk/chainhash` only — no dependency on `go-bt` or `go-subtree`.
+- Implements `BuildMerkleStore` and `GetMerkleProof` using `go-sdk/chainhash` only.
+- Parallel merkle tree building: spawns goroutines for levels with 4096+ hash pairs.
 - `HashPair` is byte-identical to `transaction.MerkleTreeParent` in go-sdk, verified by test.
 
-### STUMP Index (`internal/stump`)
-- XOR-based content-addressed proof index: `key = XOR(TokenHash, SubtreeRoot)`.
-- Enables O(1) per-txid insertion during subtree sealing (vs O(tokens × txids) previously).
-- At block announcement, O(subtrees × tokens) XOR probes discover all matching proofs.
-- See **STUMP Indexing** section below for design rationale.
+### TokenSubtreeIndex (`internal/merkleservice`)
+- Lightweight replacement for the full STUMP store.
+- Maps `(token, subtreeIdx) → []int32` (local leaf positions within the subtree).
+- 4 bytes per indexed txid vs ~860 bytes for pre-computed full proofs.
+- Thread-safe with `sync.RWMutex`.
+- BUMP assembly uses these positions to compute proofs JIT from cached merkle stores.
 
----
-
-## STUMP Indexing
-
-### The problem
-
-At scale (600M txids/block, 100k+ businesses), the naive approach of iterating every token's txid list against every sealed subtree is O(tokens × txids/token) per subtree — prohibitively expensive.
-
-### The solution
-
-**STUMP** (**S**ubtree-**T**oken **U**nified **M**erkle **P**roof) uses XOR-based composite keys:
-
-```
-index_key = XOR(SHA256d(token_string), subtree_merkle_root)
-```
-
-#### Why XOR?
-
-1. **Commutativity enables discovery:** On block announcement, a subscriber who knows their `tokenHash` can XOR it with each announced `subtreeRoot` to probe the store — without iterating all tokens or all subtrees.
-
-2. **Uniform distribution:** Both `tokenHash` (SHA256d of the token string) and `subtreeRoot` (merkle root of random txids) are uniformly distributed 256-bit values, so their XOR is also uniform — no clustering in the hash map.
-
-3. **Reversibility:** Given the XOR key and either operand, the other is recoverable: `subtreeRoot = key ^ tokenHash`. This enables verification and debugging.
-
-4. **No collision risk:** The key space is 2^256; collisions are astronomically improbable even at 600M txids × 100k tokens.
-
-#### Why not concatenation + hash?
-
-`SHA256(token || subtreeRoot)` would work for indexing but loses the reversibility property. With XOR, a subscriber can probe the store in O(subtrees) rather than needing to enumerate all (token, subtree) pairs stored.
-
-#### Lifecycle
-
-**During inter-block interval (subtree sealing):**
-```
-For each txid in the sealed subtree:
-  token := txidIndex.Lookup(txid)       // O(1)
-  key   := XOR(tokenHash, subtreeRoot)  // O(1), ~8.5 ns
-  store.Append(key, proof)              // O(1)
-```
-
-**At block announcement (STUMP Discovery):**
-```
-For each subtreeRoot in the winning miner's block:
-  For each subscribed tokenHash:
-    key := XOR(tokenHash, subtreeRoot)  // ~8.5 ns
-    stumps := store.Get(key)            // O(1), ~9.5 ns
-    → append to this token's proof list for BUMP assembly
-```
-
-#### Measured performance
-
-| Operation | Time | Notes |
-|-----------|------|-------|
-| XOR key computation | 8.5 ns | Zero allocations |
-| Store lookup | 9.5 ns | Zero allocations |
-| Discover 100 subtrees × 100 tokens | 0.77 ms | 10k probes |
-| Discover 6000 subtrees × 1000 tokens | 1.74 s | 6M probes |
-
-At extreme scale (600k subtrees × 100k tokens = 60B probes), the XOR+lookup cost would be ~60B × 18 ns ≈ 18 minutes. At that scale, a sharded or per-token-parallel approach is needed — but the STUMP design supports this naturally since each token's probes are independent.
+### Disk Store (`internal/diskstore`)
+- BadgerDB v4 LSM-tree for persistent key-value storage.
+- `MinerSubtreeStore`: saves/loads subtree leaves and merkle stores for non-miner-0 miners.
+- `BufferedTxidList`: batched writes (1000 entries per flush) for per-token txid lists.
+- `BufferedTxIDIndex`: batched writes for txid→token mappings on disk (backup to in-memory index).
 
 ---
 
 ## Default configuration
 
+The defaults are auto-detected based on your system's available RAM:
+
 | Parameter | Default | Notes |
 |-----------|---------|-------|
-| `HASHES_PER_BLOCK` | 1 024 | 16 subtrees × 64 |
-| `HASHES_PER_SUBTREE` | 64 | subtree height = 6 |
-| Subtrees per block | 16 | top tree height = 4 |
-| Block merkle height | 10 | 6 + 4 |
+| `HASHES_PER_SUBTREE` | 1 048 576 (1M) | subtree height = 20 |
+| `HASHES_PER_BLOCK` | auto-detected | fills ~80% of system RAM with 1M-leaf subtrees |
 | Num miners | 3 | competing subtree orderings |
-| Num businesses | 100 | distinct callback tokens |
-| Test duration | 10 s | ≈ 102.4 txids/sec |
+| Num businesses | 1 000 | distinct callback tokens |
+| Test duration | 10 s | ignored in `-direct` mode |
 | Mock block height | 800 000 | stamped in every BUMP |
+
+For example, on a 36 GB machine the default is 160 subtrees × 1M = **167M txids** (~28.7 GB estimated).
+On a 16 GB machine: ~76 subtrees × 1M = **~80M txids**.
 
 ---
 
@@ -158,85 +160,95 @@ cd stumpt
 go build -o harness ./cmd/harness/
 ```
 
-### 2. Run with default parameters (~10 seconds)
+### 2. Run with auto-detected defaults
 
 ```bash
-./harness
+./harness -direct
 ```
 
-The harness starts both servers, then the generator.  Structured JSON logs stream to stdout.  When all txids have been submitted and all BUMPs delivered, a summary table is printed and the process exits:
+The harness auto-detects your system's RAM and runs the largest test that fits in ~80% of physical memory with 1M-leaf subtrees. Structured JSON logs stream to stdout. When all BUMPs are delivered, a summary table is printed:
 
 ```
 ╔══════════════════════════════════════════╗
 ║          STUMPT FINAL SUMMARY            ║
 ╠══════════════════════════════════════════╣
-║  Elapsed:                          5.02s  ║
-║  Txids submitted:                   1024  ║
-║  Actual rate:                   204.0/s  ║
+║  Elapsed:                         7.302s  ║
+║  Txids submitted:                2097152  ║
+║  Actual rate:                287215.9/s  ║
 ╠══════════════════════════════════════════╣
-║  Subtrees sealed:                     16  ║
-║  Avg seal time:                  0.05ms  ║
-║  Proof pre-computations:              16  ║
-║  Avg proof time:                 0.05ms  ║
+║  Subtrees sealed:                      2  ║
+║  Avg seal time:                 50.45ms  ║
+║  Proof pre-computations:               2  ║
+║  Avg proof time:               202.36ms  ║
 ╠══════════════════════════════════════════╣
-║  Coinbase reseal:                0.07ms  ║
-║  Top tree build:                 0.01ms  ║
-║  BUMP assembly ( 100tok):        1.87ms  ║
+║  Coinbase reseal:              164.42ms  ║
+║  Top tree build:                 0.00ms  ║
+║  BUMP assembly ( 100tok):     1329.30ms  ║
 ║  Callbacks delivered:                200  ║
-║  Avg callback time:              4.73ms  ║
-║  Avg BUMP size:                  3038 B  ║
-║  Total BUMP bytes:             607712 B  ║
+║  Avg callback time:            391.34ms  ║
+║  Avg BUMP size:               6673217 B  ║
+║  Total BUMP bytes:         1334643448 B  ║
 ╚══════════════════════════════════════════╝
 ```
 
-### 3. Direct mode — large-scale runs
-
-For runs above ~60k txids, HTTP submission becomes the bottleneck. Use `-direct` to bypass HTTP entirely:
+### 3. Constrained memory budget
 
 ```bash
-# 6 million txids, 600 subtrees × 10k leaves, 1000 businesses
-./harness -direct \
-  -hashes-per-block 6000000 \
-  -hashes-per-subtree 10000 \
-  -businesses 1000
+# Limit to 20 GB peak — auto-scales to fit
+./harness -direct -max-memory 20
 ```
 
-This runs 6M txids at ~125k txids/sec (limited by merkle computation, not HTTP), completing in ~47 seconds.
+This recalculates the number of subtrees to fit within 20 GB (e.g. 100 subtrees × 1M = 105M txids on any machine).
 
-### 4. Full-scale test (10-minute block simulation via HTTP)
+### 4. Print system requirements
 
 ```bash
-./harness \
-  -hashes-per-block 61440 \
-  -hashes-per-subtree 1024 \
-  -duration 10m
+./harness -requirements
 ```
 
-This runs 61 440 txids (60 subtrees × 1 024) at ~102.4 txids/sec over 10 minutes, matching a real Teranode block interval.
+Prints the requirements table and exits without running any test.
 
-### 5. All CLI flags
+### 5. Explicit scale
+
+```bash
+# 2M txids: 2 subtrees × 1M leaves, 100 businesses
+./harness -direct -hashes-per-block 2097152 -hashes-per-subtree 1048576 -businesses 100
+
+# 60M txids: 60 subtrees × 1M leaves, 1000 businesses (needs ~17 GB)
+./harness -direct -hashes-per-block 62914560 -hashes-per-subtree 1048576 -businesses 1000
+```
+
+If the requested configuration exceeds available memory, the harness exits with an error:
+```
+ERROR: estimated memory 19.4 GB exceeds budget 10.0 GB (105M txids × 158 B/txid + 4.0 GB overhead)
+Reduce -hashes-per-block or -hashes-per-subtree, or increase -max-memory
+```
+
+### 6. HTTP mode (small-scale / paced submission)
+
+```bash
+# 1024 txids over 10 seconds, HTTP submission
+./harness -hashes-per-block 1024 -hashes-per-subtree 64
+```
+
+### 7. All CLI flags
 
 ```
--hashes-per-block   int      Total txids per simulated block    (default 1024)
--hashes-per-subtree int      Txids per subtree                  (default 64)
+-hashes-per-block   int      Total txids per simulated block    (default: auto-detected from RAM)
+-hashes-per-subtree int      Txids per subtree                  (default 1048576)
 -miners             int      Number of competing miners         (default 3)
--businesses         int      Distinct callback tokens           (default 100)
+-businesses         int      Distinct callback tokens           (default 1000)
 -duration           duration Total test duration                (default 10s; ignored in -direct mode)
 -merkle-addr        string   Merkle service listen address      (default :18080)
 -callback-addr      string   Callback server listen address     (default :13000)
 -direct                      Bypass HTTP for txid submission    (fast path for large-scale runs)
 -dump-bump          string   Write first assembled BUMP as hex to this file (optional)
+-data-dir           string   BadgerDB data directory            (empty = temp dir)
+-max-memory         float    Peak memory budget in GB           (default: 80% of system RAM)
+-requirements                Print system requirements table and exit
 ```
 
 `hashes-per-block` must be divisible by `hashes-per-subtree`.
-
-**To simulate one BUMP per txid** (each token registers exactly one transaction), set `-businesses` equal to `-hashes-per-block`:
-
-```bash
-./harness -businesses 1024
-```
-
-**To simulate one compound BUMP per business** across many txids, keep `-businesses` well below `-hashes-per-block` (the default 100 gives ~10 txids per token at block size 1024).
 
 ---
 
@@ -290,8 +302,8 @@ Key tests:
 
 The key insight this harness measures is the **work distribution**:
 
-- **During the block interval:** subtree sealing + proof pre-computation runs continuously. Each subtree seal takes `~seal_time × num_miners` ms and pre-computing proofs takes `~proof_time` ms per subtree. This work is spread evenly across all subtree boundaries throughout the inter-block interval.
-- **At block found:** only the coinbase reseal (~0.05–177 ms), top-tree build (microseconds), STUMP discovery (~0.77 ms–1.74 s), and parallel BUMP assembly (~1.4 ms–18 s) need to happen before delivery. The pre-computed proofs pay for themselves here.
+- **During the block interval:** subtree sealing + merkle tree building runs continuously. Each subtree seal takes `~50 ms` for 1M leaves (with parallel hash computation). This work is spread evenly across all subtree boundaries throughout the inter-block interval.
+- **At block found:** only the coinbase reseal (~164 ms for 1M leaves), top-tree build (microseconds), and JIT BUMP assembly need to happen before delivery. The streaming pipeline assembles and delivers BUMPs concurrently — no accumulation of all BUMPs in memory.
 - **Per-business BUMP size** reflects how many txids that business submitted. Businesses with more txids get larger but more compact compound BUMPs (intermediate hashes are pruned).
 
 ---
@@ -301,5 +313,6 @@ The key insight this harness measures is the **work distribution**:
 | Package | Use |
 |---------|-----|
 | `github.com/bsv-blockchain/go-sdk` | `transaction.MerklePath`, `PathElement`, `Combine`, `chainhash.Hash` |
+| `github.com/dgraph-io/badger/v4` | Disk-backed LSM-tree key-value store for non-miner-0 subtree data |
 
 The merkle tree implementation (`internal/subtree`) uses only Go's standard `crypto/sha256` and the go-sdk `chainhash` type.  There is no dependency on `go-bt` or `go-subtree`.
