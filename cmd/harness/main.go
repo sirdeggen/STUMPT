@@ -1,13 +1,11 @@
 // STUMPT – Subtree + BUMP Timing harness.
 //
-// Runs three components in a single process, communicating over localhost HTTP:
+// Runs a 4-phase pipeline in a single process:
 //
-//  1. Callback server  (:13000) – receives BUMP deliveries from the merkle service.
-//  2. Merkle service   (:18080) – accepts /watch, seals subtrees, assembles BUMPs.
-//  3. Generator              – submits random txids to /watch at a controlled rate.
-//
-// With -direct mode, the generator bypasses HTTP and calls the registry directly,
-// enabling large-scale runs (6M+ txids) that would be bottlenecked by HTTP.
+//  1. Generate random txids (Phase 1)
+//  2. Seal subtrees to disk for all miners (Phase 2)
+//  3. Token→position indexing (done during Phase 2)
+//  4. Block found: load from disk, assemble BUMPs (Phase 4 — critical path)
 //
 // Usage:
 //
@@ -15,42 +13,40 @@
 //
 // Flags:
 //
-//	-hashes-per-block   N    default auto-detected from RAM (1M-leaf subtrees × available memory)
+//	-hashes-per-block   N    default auto-detected from RAM
 //	-hashes-per-subtree N    default 1048576 (1M leaves per subtree)
 //	-miners             N    default 3
 //	-businesses         N    default 1000
-//	-duration           dur  default 10s  (controls txid submission rate; ignored in -direct mode)
-//	-merkle-addr        addr default :18080
-//	-callback-addr      addr default :13000
-//	-direct                  bypass HTTP for txid submission (fast path for large-scale runs)
 //	-dump-bump          path write first assembled BUMP as hex to this file
-//	-max-memory         GB   peak memory budget in GB (default: 80% of system RAM)
+//	-data-dir           path BadgerDB data directory (empty = temp dir)
+//	-max-memory         GB   peak memory budget in GB (default: 55% of system RAM)
 //	-requirements            print system requirements table and exit
 package main
 
 import (
-	"context"
+	"crypto/rand"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
+	"runtime"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
-	"github.com/bsv-blockchain/stumpt/internal/callback"
 	"github.com/bsv-blockchain/stumpt/internal/config"
 	"github.com/bsv-blockchain/stumpt/internal/diskstore"
-	"github.com/bsv-blockchain/stumpt/internal/generator"
 	"github.com/bsv-blockchain/stumpt/internal/merkleservice"
 	"github.com/bsv-blockchain/stumpt/internal/metrics"
-	"github.com/bsv-blockchain/stumpt/internal/netutil"
 )
+
+// overheadBytes mirrors config's overhead constant for cache size calculation.
+const overheadBytes = 1 << 30
 
 func main() {
 	cfg := config.Default()
-	var directMode bool
 	var showRequirements bool
 	var maxMemGB float64
 
@@ -61,21 +57,13 @@ func main() {
 	flag.IntVar(&cfg.NumMiners, "miners", cfg.NumMiners,
 		"Number of competing miners to simulate")
 	flag.IntVar(&cfg.NumBusinesses, "businesses", cfg.NumBusinesses,
-		"Number of distinct callback tokens (set equal to hashes-per-block for one BUMP per txid)")
-	flag.DurationVar(&cfg.TestDuration, "duration", cfg.TestDuration,
-		"Total test duration (controls submission rate; ignored in -direct mode)")
-	flag.StringVar(&cfg.MerkleServiceAddr, "merkle-addr", cfg.MerkleServiceAddr,
-		"Merkle service listen address")
-	flag.StringVar(&cfg.CallbackAddr, "callback-addr", cfg.CallbackAddr,
-		"Callback server listen address")
+		"Number of distinct callback tokens")
 	flag.StringVar(&cfg.DumpBUMPFile, "dump-bump", cfg.DumpBUMPFile,
 		"If set, write the first assembled BUMP as a hex string to this file")
 	flag.StringVar(&cfg.DataDir, "data-dir", cfg.DataDir,
 		"BadgerDB data directory (empty = temp dir)")
-	flag.BoolVar(&directMode, "direct", false,
-		"Bypass HTTP for txid submission (fast path for large-scale runs)")
 	flag.Float64Var(&maxMemGB, "max-memory", 0,
-		"Peak memory budget in GB (default: 80% of system RAM)")
+		"Peak memory budget in GB (default: 55% of system RAM)")
 	flag.BoolVar(&showRequirements, "requirements", false,
 		"Print system requirements table and exit")
 	flag.Parse()
@@ -100,7 +88,7 @@ func main() {
 		}
 	}
 
-	// Validate
+	// Validate.
 	if cfg.HashesPerBlock <= 0 || cfg.HashesPerSubtree <= 0 {
 		slog.Error("hashes-per-block and hashes-per-subtree must be positive")
 		os.Exit(1)
@@ -140,25 +128,25 @@ func main() {
 		"blockMerkleHeight", cfg.BlockMerkleHeight(),
 		"numMiners", cfg.NumMiners,
 		"numBusinesses", cfg.NumBusinesses,
-		"submissionInterval", cfg.SubmissionInterval(),
-		"testDuration", cfg.TestDuration,
-		"directMode", directMode,
 		"estMemoryGB", fmt.Sprintf("%.1f", float64(cfg.EstimatedMemoryBytes())/(1<<30)),
 		"memBudgetGB", fmt.Sprintf("%.1f", float64(cfg.MaxMemoryBytes)/(1<<30)),
 	)
 
+	// Handle OS signals for clean shutdown.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		slog.Info("interrupt received, exiting")
+		os.Exit(1)
+	}()
+
 	mc := metrics.NewCollector()
-
-	if directMode {
-		runDirect(cfg, mc)
-	} else {
-		runHTTP(cfg, mc)
-	}
+	run(cfg, mc)
 }
 
-// runDirect runs the harness in direct mode — no HTTP, no ticker pacing.
-// Txids are submitted directly to the registry for maximum throughput.
-func runDirect(cfg *config.Config, mc *metrics.Collector) {
+func run(cfg *config.Config, mc *metrics.Collector) {
+	// Open BadgerDB for subtree storage.
 	db, err := diskstore.Open(cfg.DataDir)
 	if err != nil {
 		slog.Error("badgerdb: open failed", "err", err)
@@ -166,151 +154,139 @@ func runDirect(cfg *config.Config, mc *metrics.Collector) {
 	}
 	defer db.Close()
 
-	// In direct mode we still need the callback server for BUMP delivery.
-	ctx, cancel := context.WithTimeout(
-		context.Background(),
-		5*time.Minute,
+	// ════════════════════════════════════════════════════════════════════════
+	// PHASE 1 — Generate txids
+	// ════════════════════════════════════════════════════════════════════════
+	slog.Info("PHASE 1: generating txids", "count", cfg.HashesPerBlock)
+	t1 := time.Now()
+
+	txids := make([]chainhash.Hash, cfg.HashesPerBlock)
+	// Generate in parallel chunks for speed.
+	numWorkers := runtime.GOMAXPROCS(0)
+	chunkSize := (cfg.HashesPerBlock + numWorkers - 1) / numWorkers
+	var genWg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		lo := w * chunkSize
+		hi := lo + chunkSize
+		if hi > cfg.HashesPerBlock {
+			hi = cfg.HashesPerBlock
+		}
+		if lo >= hi {
+			break
+		}
+		genWg.Add(1)
+		go func(lo, hi int) {
+			defer genWg.Done()
+			for i := lo; i < hi; i++ {
+				rand.Read(txids[i][:])
+			}
+		}(lo, hi)
+	}
+	genWg.Wait()
+
+	phase1Dur := time.Since(t1)
+	mc.RecordPhase1(phase1Dur)
+	slog.Info("PHASE 1 complete",
+		"txids", cfg.HashesPerBlock,
+		"duration", phase1Dur,
+		"rate", fmt.Sprintf("%.0f/s", float64(cfg.HashesPerBlock)/phase1Dur.Seconds()),
 	)
-	defer cancel()
 
-	// Handle OS signals for clean shutdown.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		slog.Info("interrupt received, shutting down")
-		cancel()
-	}()
+	// Remember first txid for coinbase replacement.
+	firstTxid := txids[0]
 
-	// Bind callback listener.
-	cbLn, cbAddr, err := netutil.Listen(cfg.CallbackAddr, 100)
-	if err != nil {
-		slog.Error("callback: bind failed", "err", err)
-		os.Exit(1)
-	}
-	if cbAddr != cfg.CallbackAddr {
-		slog.Info("callback port in use, shifted", "requested", cfg.CallbackAddr, "using", cbAddr)
-	}
-	cfg.CallbackAddr = cbAddr
-
-	// Bind merkle service listener (needed for CallbackURL computation).
-	msLn, msAddr, err := netutil.Listen(cfg.MerkleServiceAddr, 100)
-	if err != nil {
-		slog.Error("merkle service: bind failed", "err", err)
-		os.Exit(1)
-	}
-	if msAddr != cfg.MerkleServiceAddr {
-		slog.Info("merkle service port in use, shifted", "requested", cfg.MerkleServiceAddr, "using", msAddr)
-	}
-	cfg.MerkleServiceAddr = msAddr
-	_ = msLn.Close() // Not needed in direct mode.
-
-	// Start callback server.
-	cbSrv := callback.NewServer(cbLn, mc)
-	go cbSrv.Start(ctx)
-
-	// Create the merkle service server to get access to the registry's
-	// AddTxIDDirect method and the onBlockComplete pipeline.
-	msSrv := merkleservice.NewServer(cfg, mc, nil, db)
-
-	// Run the direct generator.
-	gen := generator.NewDirect(cfg, mc)
-
-	slog.Info("running in DIRECT mode (no HTTP submission)")
-
-	cbURL := cfg.CallbackURL()
-	evt := gen.RunDirect(func(txid chainhash.Hash, token string, _ string) interface{} {
-		return msSrv.AddTxIDDirect(txid, token, cbURL)
-	})
-
-	if evt != nil {
-		slog.Info("block complete in direct mode, processing BUMPs")
-		msSrv.ProcessBlock(evt)
-	}
-
-	// Wait briefly for deliveries to flush.
-	time.Sleep(2 * time.Second)
-
-	mc.PrintSummary(cfg.NumBusinesses)
-}
-
-// runHTTP runs the original HTTP-based harness.
-func runHTTP(cfg *config.Config, mc *metrics.Collector) {
-	db, err := diskstore.Open(cfg.DataDir)
-	if err != nil {
-		slog.Error("badgerdb: open failed", "err", err)
-		os.Exit(1)
-	}
-	defer db.Close()
-
-	// The main context governs HTTP servers and the generator.
-	ctx, cancel := context.WithTimeout(
-		context.Background(),
-		cfg.TestDuration*2+5*time.Minute,
+	// ════════════════════════════════════════════════════════════════════════
+	// PHASE 2 — Seal subtrees to disk + index token positions
+	// ════════════════════════════════════════════════════════════════════════
+	slog.Info("PHASE 2: sealing subtrees to disk",
+		"numSubtrees", cfg.NumSubtrees(),
+		"miners", cfg.NumMiners,
 	)
-	defer cancel()
+	t2 := time.Now()
 
-	// Handle OS signals for clean shutdown.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		slog.Info("interrupt received, shutting down")
-		cancel()
-	}()
+	// Per-miner token→subtree position indexes.
+	minerTokenIdx := make([]*merkleservice.TokenSubtreeIndex, cfg.NumMiners)
+	for i := range minerTokenIdx {
+		minerTokenIdx[i] = merkleservice.NewTokenSubtreeIndex()
+	}
 
-	// ── Bind listeners (auto-increment port if in use) ───────────────────────
-	cbLn, cbAddr, err := netutil.Listen(cfg.CallbackAddr, 100)
-	if err != nil {
-		slog.Error("callback: bind failed", "err", err)
+	minerRoots := merkleservice.SealSubtreesToDisk(txids, cfg, db, mc, minerTokenIdx)
+
+	phase2Dur := time.Since(t2)
+	mc.RecordPhase2(phase2Dur)
+	slog.Info("PHASE 2 complete",
+		"subtrees", cfg.NumSubtrees(),
+		"duration", phase2Dur,
+	)
+
+	// Free the txid list — it's no longer needed.
+	txids = nil
+	runtime.GC()
+
+	// ════════════════════════════════════════════════════════════════════════
+	// PHASE 4 — Block found (critical path, timed)
+	// ════════════════════════════════════════════════════════════════════════
+	slog.Info("PHASE 4: block found — assembling BUMPs")
+	t4 := time.Now()
+
+	// Finalize: pick winner, coinbase reseal.
+	evt := merkleservice.FinalizeBlock(cfg, mc, db, minerRoots, minerTokenIdx, firstTxid)
+	if evt == nil {
+		slog.Error("block finalization failed")
 		os.Exit(1)
 	}
-	if cbAddr != cfg.CallbackAddr {
-		slog.Info("callback port in use, shifted", "requested", cfg.CallbackAddr, "using", cbAddr)
+
+	// Free non-winner TokenSubtreeIndex data.
+	for m := 0; m < cfg.NumMiners; m++ {
+		if m != evt.WinnerMiner {
+			minerTokenIdx[m] = nil
+		}
 	}
-	cfg.CallbackAddr = cbAddr
+	minerTokenIdx = nil
+	minerRoots = nil
 
-	msLn, msAddr, err := netutil.Listen(cfg.MerkleServiceAddr, 100)
-	if err != nil {
-		slog.Error("merkle service: bind failed", "err", err)
-		os.Exit(1)
+	// Calculate subtree cache size: each 1M-leaf subtree is ~100MB in memory.
+	// Use remaining memory budget for the cache.
+	bytesPerCachedSubtree := int64(cfg.HashesPerSubtree) * 100 // ~100B per leaf (leaves + store)
+	tokenIdxMem := int64(cfg.HashesPerBlock) * 4               // winner's TokenSubtreeIndex
+	available := cfg.MaxMemoryBytes - overheadBytes - tokenIdxMem
+	if available < 0 {
+		available = bytesPerCachedSubtree // at least 1
 	}
-	if msAddr != cfg.MerkleServiceAddr {
-		slog.Info("merkle service port in use, shifted", "requested", cfg.MerkleServiceAddr, "using", msAddr)
+	maxCacheEntries := int(available / bytesPerCachedSubtree)
+	if maxCacheEntries < 1 {
+		maxCacheEntries = 1
 	}
-	cfg.MerkleServiceAddr = msAddr
-
-	// ── Start callback server ─────────────────────────────────────────────────
-	cbSrv := callback.NewServer(cbLn, mc)
-	go cbSrv.Start(ctx)
-
-	// ── Start merkle service ──────────────────────────────────────────────────
-	msSrv := merkleservice.NewServer(cfg, mc, msLn, db)
-	go msSrv.Start(ctx)
-
-	// ── Run generator (blocks until all txids submitted) ─────────────────────
-	gen := generator.New(cfg, mc)
-
-	// Cancel the main context as soon as the block pipeline finishes.
-	go func() {
-		msSrv.WaitForBlock(ctx)
-		cancel()
-	}()
-
-	gen.Run(ctx)
-
-	// ── Wait for block finalization + BUMP delivery ───────────────────────────
-	slog.Info("generator done; waiting for block pipeline")
-	msSrv.WaitForBlock(ctx)
-
-	// ── Summary ───────────────────────────────────────────────────────────────
-	mc.PrintSummary(cfg.NumBusinesses)
-}
-
-// formatRate returns a human-readable rate string.
-func formatRate(count int, d time.Duration) string {
-	if d == 0 {
-		return "∞"
+	if maxCacheEntries > cfg.NumSubtrees() {
+		maxCacheEntries = cfg.NumSubtrees()
 	}
-	return fmt.Sprintf("%.0f/s", float64(count)/d.Seconds())
+
+	slog.Info("subtree cache configured",
+		"maxEntries", maxCacheEntries,
+		"bytesPerSubtree", bytesPerCachedSubtree,
+		"availableGB", fmt.Sprintf("%.1f", float64(available)/(1<<30)),
+	)
+
+	// Assemble BUMPs from disk-backed subtrees.
+	merkleservice.ProcessBUMPs(
+		cfg.BlockHeight,
+		cfg.SubtreeHeight(),
+		cfg.TopTreeHeight(),
+		cfg.BlockMerkleHeight(),
+		mc,
+		evt,
+		cfg.DumpBUMPFile,
+		maxCacheEntries,
+	)
+
+	phase4Dur := time.Since(t4)
+	mc.RecordPhase4(phase4Dur)
+	slog.Info("PHASE 4 complete",
+		"duration", phase4Dur,
+	)
+
+	// ════════════════════════════════════════════════════════════════════════
+	// Summary
+	// ════════════════════════════════════════════════════════════════════════
+	mc.PrintSummary(cfg.HashesPerBlock, cfg.NumBusinesses)
 }

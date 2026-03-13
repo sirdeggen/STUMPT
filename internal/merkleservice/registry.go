@@ -2,6 +2,7 @@ package merkleservice
 
 import (
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
@@ -13,340 +14,221 @@ import (
 	"github.com/bsv-blockchain/stumpt/internal/config"
 	"github.com/bsv-blockchain/stumpt/internal/diskstore"
 	"github.com/bsv-blockchain/stumpt/internal/metrics"
-	"github.com/bsv-blockchain/stumpt/internal/stump"
 	"github.com/bsv-blockchain/stumpt/internal/subtree"
 )
 
-// Registry holds all mutable state for the Merkle Service.
-type Registry struct {
-	mu  sync.Mutex
-	cfg *config.Config
-	mc  *metrics.Collector
-
-	// Disk-backed ordered list of every received txid (buffered writes).
-	txidList *diskstore.BufferedTxidList
-
-	// per-token callback targets.
-	tokenCallback map[string]CallbackInfo
-
-	// minerSubtrees[minerIdx] is the ordered list of sealed subtrees for that miner.
-	// Only Root is retained in memory; Leaves/Store are evicted to disk after sealing.
-	minerSubtrees [][]*MinerSubtree
-
-	// ── Indexing ────────────────────────────────────────────────────────
-	txidIndex      stump.TxIDIndexer
-	tokenReg       *stump.TokenRegistry
-	tokenSubtreeIdx *TokenSubtreeIndex
-
-	// blockCh is closed once the block is complete, signalling the server.
-	blockCh chan *BlockFinalizedEvent
-
-	// minerSubStore persists MinerSubtree leaves/store to disk for eviction.
-	minerSubStore *diskstore.MinerSubtreeStore
-}
-
-// newRegistry creates an initialised Registry.
-func newRegistry(cfg *config.Config, mc *metrics.Collector, db *diskstore.DB) *Registry {
-	return &Registry{
-		cfg:           cfg,
-		mc:            mc,
-		txidList:      diskstore.NewBufferedTxidList(db, 1000),
-		tokenCallback: make(map[string]CallbackInfo),
-		minerSubtrees: make([][]*MinerSubtree, cfg.NumMiners),
-		txidIndex:       stump.NewMemTxIDIndex(),
-		tokenReg:        stump.NewTokenRegistry(),
-		tokenSubtreeIdx: NewTokenSubtreeIndex(),
-		blockCh:       make(chan *BlockFinalizedEvent, 1),
-		minerSubStore: diskstore.NewMinerSubtreeStore(db),
-	}
-}
-
-// AddTxID records a new txid, triggers subtree sealing when appropriate, and
-// returns a BlockFinalizedEvent (non-nil) when the block is now complete.
+// SealSubtreesToDisk is Phase 2 of the pipeline: for each subtree boundary,
+// jitter txids per miner, build merkle stores, save to disk, and index
+// token→leaf positions in each miner's TokenSubtreeIndex.
 //
-// Subtree sealing is synchronous (blocking the HTTP handler for ~30 ms once
-// every ~10 s at the default rate) so that the pre-computed proofs are always
-// ready before the next subtree starts.
-func (r *Registry) AddTxID(txidHex, token string, cb CallbackInfo) *BlockFinalizedEvent {
-	txid, err := hexToHash(txidHex)
-	if err != nil {
-		slog.Warn("registry: bad txid hex", "err", err)
-		return nil
-	}
+// Returns per-miner subtree roots (roots[minerIdx][subtreeIdx]).
+// The txids slice may be nilled by the caller after this returns.
+func SealSubtreesToDisk(
+	txids []chainhash.Hash,
+	cfg *config.Config,
+	db *diskstore.DB,
+	mc *metrics.Collector,
+	minerTokenIdx []*TokenSubtreeIndex,
+) [][]chainhash.Hash {
+	numSubtrees := cfg.NumSubtrees()
+	minerSubStore := diskstore.NewMinerSubtreeStore(db)
 
-	// Register token and index txid→token.
-	r.tokenReg.Register(token)
-	r.txidIndex.Set(txid, token)
-
-	r.txidList.Append(txid)
-	n := r.txidList.Len()
-
-	r.mu.Lock()
-	r.tokenCallback[token] = cb
-	cfg := r.cfg
-
-	// Seal a subtree every HashesPerSubtree txids.
-	if n%cfg.HashesPerSubtree == 0 {
-		subtreeIdx := (n / cfg.HashesPerSubtree) - 1
-		start := subtreeIdx * cfg.HashesPerSubtree
-		base := r.txidList.Slice(start, n)
-		r.mu.Unlock()
-
-		r.sealSubtree(subtreeIdx, base)
-	} else {
-		r.mu.Unlock()
-	}
-
-	// Check for block completion after lock is released.
-	n2 := r.txidList.Len()
-
-	if n2 == cfg.HashesPerBlock {
-		return r.finalizeBlock()
-	}
-	return nil
-}
-
-// AddTxIDDirect is the in-process fast path for large-scale runs.
-// It bypasses JSON/HTTP overhead and accepts pre-computed txid hashes directly.
-// Returns a BlockFinalizedEvent when the block is complete.
-func (r *Registry) AddTxIDDirect(txid chainhash.Hash, token string, cb CallbackInfo) *BlockFinalizedEvent {
-	// Register token and index txid→token.
-	r.tokenReg.Register(token)
-	r.txidIndex.Set(txid, token)
-
-	r.txidList.Append(txid)
-	n := r.txidList.Len()
-
-	r.mu.Lock()
-	r.tokenCallback[token] = cb
-	cfg := r.cfg
-
-	// Seal a subtree every HashesPerSubtree txids.
-	if n%cfg.HashesPerSubtree == 0 {
-		subtreeIdx := (n / cfg.HashesPerSubtree) - 1
-		start := subtreeIdx * cfg.HashesPerSubtree
-		base := r.txidList.Slice(start, n)
-		r.mu.Unlock()
-
-		r.sealSubtree(subtreeIdx, base)
-	} else {
-		r.mu.Unlock()
-	}
-
-	// Check for block completion after lock is released.
-	n2 := r.txidList.Len()
-
-	if n2 == cfg.HashesPerBlock {
-		return r.finalizeBlock()
-	}
-	return nil
-}
-
-// sealSubtree builds all miners' versions of the subtree and pre-computes
-// miner-0 proofs using the STUMP XOR index. Called without the registry lock.
-//
-// ## Indexing strategy
-//
-// Instead of the old approach (iterate every token's txid list to find which
-// belong to this subtree), we use the txidIndex to look up each txid's token
-// in O(1), then group proofs by XOR(tokenHash, subtreeRoot) for O(1) storage
-// and later O(1) retrieval at block announcement.
-//
-// This changes the per-subtree work from O(tokens × txids/token) to
-// O(hashesPerSubtree) — a dramatic improvement at scale.
-func (r *Registry) sealSubtree(subtreeIdx int, baseTxids []chainhash.Hash) {
-	cfg := r.cfg
-	t0 := time.Now()
-
-	// ── Parallel miner tree building ─────────────────────────────────────────
-	minerSubs := make([]*MinerSubtree, cfg.NumMiners)
-	var wg sync.WaitGroup
-	wg.Add(cfg.NumMiners)
+	// Per-miner roots.
+	roots := make([][]chainhash.Hash, cfg.NumMiners)
 	for m := 0; m < cfg.NumMiners; m++ {
-		go func(m int) {
-			defer wg.Done()
-			leaves := jitterTxids(baseTxids, m, subtreeIdx, cfg.JitterPercent)
-			store := subtree.BuildMerkleStore(leaves)
-			root := store[len(store)-1]
-			minerSubs[m] = &MinerSubtree{
-				Index:  subtreeIdx,
-				Leaves: leaves,
-				Root:   root,
-				Store:  store,
+		roots[m] = make([]chainhash.Hash, numSubtrees)
+	}
+
+	for si := 0; si < numSubtrees; si++ {
+		start := si * cfg.HashesPerSubtree
+		end := start + cfg.HashesPerSubtree
+		base := txids[start:end]
+
+		t0 := time.Now()
+
+		// Build all miners' subtrees in parallel.
+		minerSubs := make([]*MinerSubtree, cfg.NumMiners)
+		var wg sync.WaitGroup
+		wg.Add(cfg.NumMiners)
+		for m := 0; m < cfg.NumMiners; m++ {
+			go func(m int) {
+				defer wg.Done()
+				leaves := jitterTxids(base, m, si, cfg.JitterPercent)
+				store := subtree.BuildMerkleStore(leaves)
+				root := store[len(store)-1]
+				minerSubs[m] = &MinerSubtree{
+					Index:  si,
+					Leaves: leaves,
+					Root:   root,
+					Store:  store,
+				}
+			}(m)
+		}
+		wg.Wait()
+
+		sealDur := time.Since(t0)
+		mc.RecordSubtreeSeal(sealDur)
+
+		// Save all miners' subtrees to disk.
+		tDisk := time.Now()
+		for m := 0; m < cfg.NumMiners; m++ {
+			ms := minerSubs[m]
+			roots[m][si] = ms.Root
+
+			// Serialize leaves and store as flat byte slices.
+			leavesBytes := hashSliceToBytes(ms.Leaves)
+			storeBytes := hashSliceToBytes(ms.Store)
+			if err := minerSubStore.Save(m, si, leavesBytes, storeBytes); err != nil {
+				slog.Error("disk write failed", "miner", m, "subtree", si, "err", err)
 			}
-		}(m)
-	}
-	wg.Wait()
-
-	r.mc.RecordSubtreeSeal(time.Since(t0))
-
-	slog.Info("subtree sealed",
-		"subtreeIdx", subtreeIdx,
-		"miners", cfg.NumMiners,
-		"sealDuration", time.Since(t0),
-	)
-
-	// Persist sealed subtrees.
-	r.mu.Lock()
-	for m := 0; m < cfg.NumMiners; m++ {
-		r.minerSubtrees[m] = append(r.minerSubtrees[m], minerSubs[m])
-	}
-	r.mu.Unlock()
-
-	// ── Index token→subtree positions (lightweight, no sibling paths) ────────
-	t1 := time.Now()
-	miner0 := minerSubs[0]
-
-	// Batch all txid→token lookups.
-	tokens := r.txidIndex.BatchGet(baseTxids)
-
-	// Build reverse-index: txid → local position in miner-0's ordering.
-	localIdx := make(map[chainhash.Hash]int, len(miner0.Leaves))
-	for i, h := range miner0.Leaves {
-		localIdx[h] = i
-	}
-
-	// Group by token and record local indices in the lightweight index.
-	tokenLocalIdxs := make(map[string][]int32)
-	for i, tok := range tokens {
-		if tok == "" {
-			continue
 		}
-		txid := baseTxids[i]
-		li, ok := localIdx[txid]
-		if !ok {
-			continue
+		mc.RecordDiskWrite(time.Since(tDisk))
+
+		// Index token→leaf positions for every miner.
+		tIdx := time.Now()
+		for m := 0; m < cfg.NumMiners; m++ {
+			ms := minerSubs[m]
+
+			// Build reverse index: txid → local position in this miner's ordering.
+			localIdx := make(map[chainhash.Hash]int, len(ms.Leaves))
+			for i, h := range ms.Leaves {
+				localIdx[h] = i
+			}
+
+			// For each leaf in canonical order, derive token from global index.
+			tokenLocalIdxs := make(map[string][]int32)
+			for i, txid := range base {
+				globalIdx := start + i
+				token := fmt.Sprintf("token-%d", globalIdx%cfg.NumBusinesses)
+				li, ok := localIdx[txid]
+				if !ok {
+					continue
+				}
+				tokenLocalIdxs[token] = append(tokenLocalIdxs[token], int32(li))
+			}
+			for tok, idxs := range tokenLocalIdxs {
+				minerTokenIdx[m].AddBatch(tok, si, idxs)
+			}
 		}
-		tokenLocalIdxs[tok] = append(tokenLocalIdxs[tok], int32(li))
-	}
-	for tok, idxs := range tokenLocalIdxs {
-		r.tokenSubtreeIdx.AddBatch(tok, subtreeIdx, idxs)
+		mc.RecordProofCompute(time.Since(tIdx))
+
+		// Free subtree data — it's on disk now.
+		for m := range minerSubs {
+			minerSubs[m] = nil
+		}
+
+		if si%10 == 0 || si == numSubtrees-1 {
+			slog.Info("subtree sealed",
+				"subtreeIdx", si,
+				"of", numSubtrees,
+				"sealMs", sealDur.Milliseconds(),
+			)
+		}
 	}
 
-	r.mc.RecordProofCompute(time.Since(t1))
-
-	slog.Info("token positions indexed",
-		"subtreeIdx", subtreeIdx,
-		"tokens", len(tokenLocalIdxs),
-		"indexDuration", time.Since(t1),
-	)
-
-	// Keep miner-0 subtrees in memory for fast BUMP assembly.
-	// Evict miners 1+ to disk to save RAM (only needed for coinbase reseal of subtree-0).
-	for m := 1; m < cfg.NumMiners; m++ {
-		ms := minerSubs[m]
-		r.minerSubStore.Save(m, subtreeIdx, hashSliceToBytes(ms.Leaves), hashSliceToBytes(ms.Store))
-		ms.Leaves = nil
-		ms.Store = nil
-	}
+	return roots
 }
 
-// finalizeBlock simulates block discovery: replaces the coinbase placeholder
-// in subtree-0, re-seals it, recomputes affected proofs, then uses STUMP
-// Discover to gather proofs for all tokens from the XOR index.
-func (r *Registry) finalizeBlock() *BlockFinalizedEvent {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+// FinalizeBlock simulates block discovery: randomly selects a winning miner,
+// loads the winner's subtree-0 from disk, replaces the coinbase, reseals it,
+// saves back, and returns the finalization event.
+func FinalizeBlock(
+	cfg *config.Config,
+	mc *metrics.Collector,
+	db *diskstore.DB,
+	minerRoots [][]chainhash.Hash,
+	minerTokenIdx []*TokenSubtreeIndex,
+	firstTxid chainhash.Hash,
+) *BlockFinalizedEvent {
+	t0 := time.Now()
+	minerSubStore := diskstore.NewMinerSubtreeStore(db)
 
-	slog.Info("block complete", "txids", r.txidList.Len())
+	// ── Select winning miner (random, simulating real mining) ──────────────
+	winner := 0
+	if cfg.NumMiners > 1 {
+		var rb [8]byte
+		if _, err := rand.Read(rb[:]); err == nil {
+			winner = int(binary.LittleEndian.Uint64(rb[:]) % uint64(cfg.NumMiners))
+		}
+	}
+
+	slog.Info("block winner selected", "miner", winner, "totalMiners", cfg.NumMiners)
 
 	// ── Coinbase replacement ────────────────────────────────────────────────
-	t0 := time.Now()
-
 	var coinbase chainhash.Hash
 	if _, err := rand.Read(coinbase[:]); err != nil {
 		slog.Error("coinbase: random generation failed", "err", err)
 	}
-	oldCoinbase, _ := r.txidList.Get(0)
-	r.txidList.Set(0, coinbase)
 
-	slog.Info("coinbase replaced",
-		"old", hex.EncodeToString(oldCoinbase[:8]),
+	slog.Info("coinbase replacing",
+		"old", hex.EncodeToString(firstTxid[:8]),
 		"new", hex.EncodeToString(coinbase[:8]),
 	)
 
-	// Reload subtree-0 leaves/store from disk if evicted.
-	for m := 0; m < r.cfg.NumMiners; m++ {
-		ms := r.minerSubtrees[m][0]
-		if ms.Leaves == nil {
-			leavesBytes, storeBytes, ok := r.minerSubStore.Load(m, 0)
-			if !ok {
-				slog.Error("coinbase: failed to reload subtree-0", "miner", m)
-				continue
-			}
-			ms.Leaves = bytesToHashSlice(leavesBytes)
-			ms.Store = bytesToHashSlice(storeBytes)
+	// Load winner's subtree-0 from disk.
+	leavesBytes, _, ok := minerSubStore.Load(winner, 0)
+	if !ok {
+		slog.Error("coinbase: failed to load winner subtree-0 from disk")
+		return nil
+	}
+	leaves := bytesToHashSlice(leavesBytes)
+
+	// Replace old coinbase with new one.
+	replaced := false
+	for i, h := range leaves {
+		if h == firstTxid {
+			leaves[i] = coinbase
+			replaced = true
+			break
 		}
 	}
-
-	// Re-seal subtree-0 for every miner: replace leaf-0, rebuild store+root.
-	for m := 0; m < r.cfg.NumMiners; m++ {
-		ms := r.minerSubtrees[m][0]
-		replaced := false
-		for i, h := range ms.Leaves {
-			if h == oldCoinbase {
-				ms.Leaves[i] = coinbase
-				replaced = true
-				break
-			}
-		}
-		if !replaced {
-			slog.Error("coinbase: old coinbase not found in miner subtree",
-				"miner", m)
-		}
-		ms.Store = subtree.BuildMerkleStore(ms.Leaves)
-		ms.Root = ms.Store[len(ms.Store)-1]
+	if !replaced {
+		slog.Error("coinbase: old coinbase not found in winning miner subtree-0", "miner", winner)
 	}
 
-	// Re-save subtree-0 to disk with the new coinbase for all miners.
-	for m := 0; m < r.cfg.NumMiners; m++ {
-		ms := r.minerSubtrees[m][0]
-		r.minerSubStore.Save(m, 0, hashSliceToBytes(ms.Leaves), hashSliceToBytes(ms.Store))
-		// Keep subtree-0 in memory for now (freed after finalization).
+	// Rebuild store and root.
+	newStore := subtree.BuildMerkleStore(leaves)
+	newRoot := newStore[len(newStore)-1]
+	minerRoots[winner][0] = newRoot
+
+	// Save resealed subtree-0 back to disk.
+	if err := minerSubStore.Save(winner, 0, hashSliceToBytes(leaves), hashSliceToBytes(newStore)); err != nil {
+		slog.Error("coinbase: failed to save resealed subtree-0", "err", err)
 	}
 
 	coinbaseDur := time.Since(t0)
-	r.mc.RecordCoinbaseReseal(coinbaseDur)
-	slog.Info("coinbase reseal complete",
-		"duration", coinbaseDur,
-	)
-
-	// ── Prepare finalization event ──────────────────────────────────────────
-	m0 := r.minerSubtrees[0]
-	roots := make([]chainhash.Hash, len(m0))
-	for i, ms := range m0 {
-		roots[i] = ms.Root
-	}
-
-	cbs := make(map[string]CallbackInfo, len(r.tokenCallback))
-	for k, v := range r.tokenCallback {
-		cbs[k] = v
-	}
+	mc.RecordCoinbaseReseal(coinbaseDur)
+	slog.Info("coinbase reseal complete", "miner", winner, "duration", coinbaseDur)
 
 	return &BlockFinalizedEvent{
-		SubtreeRoots:     roots,
-		Callbacks:        cbs,
-		TokenSubtreeIdx:  r.tokenSubtreeIdx,
-		Miner0Subtrees:   r.minerSubtrees[0],
-		MinerSubStore:    r.minerSubStore,
-		HashesPerSubtree: r.cfg.HashesPerSubtree,
+		WinnerMiner:      winner,
+		SubtreeRoots:     minerRoots[winner],
+		TokenSubtreeIdx:  minerTokenIdx[winner],
+		MinerSubStore:    minerSubStore,
+		HashesPerSubtree: cfg.HashesPerSubtree,
+		NumBusinesses:    cfg.NumBusinesses,
 	}
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-// hexToHash converts a raw-bytes hex string to chainhash.Hash (no byte reversal).
-func hexToHash(s string) (chainhash.Hash, error) {
-	b, err := hex.DecodeString(s)
-	if err != nil {
-		return chainhash.Hash{}, err
+// hashSliceToBytes converts []chainhash.Hash to a flat byte slice.
+func hashSliceToBytes(hashes []chainhash.Hash) []byte {
+	buf := make([]byte, len(hashes)*chainhash.HashSize)
+	for i, h := range hashes {
+		copy(buf[i*chainhash.HashSize:], h[:])
 	}
-	if len(b) != chainhash.HashSize {
-		return chainhash.Hash{}, fmt.Errorf("expected 32 bytes, got %d", len(b))
+	return buf
+}
+
+// bytesToHashSlice converts a flat byte slice back to []chainhash.Hash.
+func bytesToHashSlice(data []byte) []chainhash.Hash {
+	n := len(data) / chainhash.HashSize
+	result := make([]chainhash.Hash, n)
+	for i := 0; i < n; i++ {
+		copy(result[i][:], data[i*chainhash.HashSize:(i+1)*chainhash.HashSize])
 	}
-	var h chainhash.Hash
-	copy(h[:], b)
-	return h, nil
+	return result
 }
 
 // jitterTxids returns a copy of txids with a fraction of adjacent pairs swapped.
@@ -369,23 +251,3 @@ func jitterTxids(txids []chainhash.Hash, minerIdx, subtreeIdx int, jitterFrac []
 	}
 	return result
 }
-
-// hashSliceToBytes serialises a slice of chainhash.Hash into a flat byte slice.
-func hashSliceToBytes(hashes []chainhash.Hash) []byte {
-	buf := make([]byte, len(hashes)*32)
-	for i, h := range hashes {
-		copy(buf[i*32:], h[:])
-	}
-	return buf
-}
-
-// bytesToHashSlice deserialises a flat byte slice into a slice of chainhash.Hash.
-func bytesToHashSlice(data []byte) []chainhash.Hash {
-	n := len(data) / 32
-	result := make([]chainhash.Hash, n)
-	for i := 0; i < n; i++ {
-		copy(result[i][:], data[i*32:])
-	}
-	return result
-}
-

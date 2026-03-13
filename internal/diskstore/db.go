@@ -35,10 +35,10 @@ func Open(dir string) (*DB, error) {
 		WithCompactL0OnClose(false).
 		WithNumCompactors(2).
 		WithValueLogFileSize(256 << 20). // 256 MB value log files
-		WithMemTableSize(64 << 20).      // 64 MB memtable
-		WithNumMemtables(3).             // 3 memtables for write throughput
-		WithBlockCacheSize(256 << 20).   // 256 MB block cache — speeds stumpStore reads
-		WithIndexCacheSize(128 << 20).   // 128 MB index cache
+		WithMemTableSize(32 << 20).      // 32 MB memtable (only miner eviction uses disk)
+		WithNumMemtables(2).             // 2 memtables
+		WithBlockCacheSize(64 << 20).    // 64 MB block cache
+		WithIndexCacheSize(32 << 20).    // 32 MB index cache
 		WithDetectConflicts(false)       // No transaction conflicts expected
 
 	bdb, err := badger.Open(opts)

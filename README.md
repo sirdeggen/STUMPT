@@ -34,29 +34,31 @@ The harness auto-detects your system's RAM and scales the default test to use ~8
 ╠═══════════════╦═══════════════╦═══════════════╦══════════════════════════╣
 ║   Total TXIDs ║   Subtrees    ║   Est. RAM    ║   Min System RAM        ║
 ╠═══════════════╬═══════════════╬═══════════════╬══════════════════════════╣
-║            2M ║       2 × 1M ║        4.3 GB ║        5.4 GB             ║
-║            4M ║       4 × 1M ║        4.6 GB ║        5.8 GB             ║
-║           10M ║      10 × 1M ║        5.5 GB ║        6.9 GB             ║
-║           21M ║      20 × 1M ║        7.1 GB ║        8.9 GB             ║
-║           42M ║      40 × 1M ║       10.2 GB ║       12.7 GB             ║
-║           63M ║      60 × 1M ║       13.3 GB ║       16.6 GB             ║
-║          105M ║     100 × 1M ║       19.4 GB ║       24.3 GB             ║
-║          157M ║     150 × 1M ║       27.1 GB ║       33.9 GB             ║
-║          315M ║     300 × 1M ║       50.3 GB ║       62.9 GB             ║
-║          629M ║     600 × 1M ║       96.6 GB ║      120.7 GB             ║
+║            2M ║       2 × 1M ║        2.5 GB ║        4.6 GB             ║
+║            4M ║       4 × 1M ║        3.1 GB ║        5.6 GB             ║
+║           10M ║      10 × 1M ║        4.7 GB ║        8.6 GB             ║
+║           21M ║      20 × 1M ║        7.5 GB ║       13.6 GB             ║
+║           42M ║      40 × 1M ║       12.9 GB ║       23.5 GB             ║
+║           63M ║      60 × 1M ║       18.4 GB ║       33.5 GB             ║
+║          105M ║     100 × 1M ║       29.3 GB ║       53.4 GB             ║
+║          157M ║     150 × 1M ║       43.0 GB ║       78.2 GB             ║
+║          315M ║     300 × 1M ║       84.0 GB ║      152.8 GB             ║
+║          629M ║     600 × 1M ║      166.1 GB ║      301.9 GB             ║
 ╚═══════════════╩═══════════════╩═══════════════╩══════════════════════════╝
 
-Memory model: 158 B/txid + 4 GB overhead
+Memory model: 280 B/txid + 2 GB overhead
 ```
 
-**158 B/txid** breaks down as:
-- 64 B — miner-0 subtree data (leaves + merkle store, kept in memory)
-- 90 B — in-memory TxID index (`map[chainhash.Hash]string`)
+**280 B/txid** breaks down as:
+- 32 B — in-memory txid list (ordered `[]chainhash.Hash` slice)
+- 100 B — miner-0 subtree data (leaves + ~2N internal nodes in merkle store)
+- 140 B — in-memory TxID index (`map[chainhash.Hash]string` including Go map bucket overhead)
 - 4 B — TokenSubtreeIndex entry (`int32` local leaf position)
+- 4 B — temporary seal allocations (amortized)
 
-**4 GB overhead** covers BadgerDB (disk-backed storage for non-miner-0 data), Go runtime, BUMP assembly buffers, and OS overhead.
+**2 GB overhead** covers BadgerDB (miner eviction only), Go runtime/GC, BUMP assembly buffers, and OS overhead.
 
-If your machine doesn't have enough RAM for the requested configuration, the harness exits with a clear error and prints this table. Use `-max-memory` to set a specific budget, or `-requirements` to just print the table.
+The default budget is **55% of system RAM** — conservative enough to avoid swap even under GC pressure. If your machine doesn't have enough RAM for the requested configuration, the harness exits with a clear error and prints this table. Use `-max-memory` to set a specific budget, or `-requirements` to just print the table.
 
 ---
 
@@ -76,11 +78,11 @@ The system uses a hybrid in-memory / disk-backed approach to balance speed and m
 
 | Data | Storage | Why |
 |------|---------|-----|
+| Ordered txid list | **In-memory** | `[]chainhash.Hash` slice, pre-allocated to block size; used for subtree slicing |
 | Miner-0 subtree leaves + stores | **In-memory** | Hot path — needed for JIT proof computation during BUMP assembly |
-| Miners 1+ subtree data | **BadgerDB (disk)** | Cold — only needed if a non-miner-0 block wins |
-| TxID → token index | **In-memory** | Accessed on every txid arrival for O(1) lookup |
+| TxID → token index | **In-memory** | `map[chainhash.Hash]string`, accessed on every txid arrival for O(1) lookup |
 | TokenSubtreeIndex | **In-memory** | Lightweight (4B/entry), accessed during BUMP assembly |
-| Buffered txid lists | **BadgerDB (disk)** | Per-token txid lists, batched writes |
+| Miners 1+ subtree data | **BadgerDB (disk)** | Cold — only needed if a non-miner-0 block wins |
 
 ### Generator (`internal/generator`)
 - Produces `HASHES_PER_BLOCK` random 32-byte hashes (mock txids).
@@ -132,14 +134,14 @@ The defaults are auto-detected based on your system's available RAM:
 | Parameter | Default | Notes |
 |-----------|---------|-------|
 | `HASHES_PER_SUBTREE` | 1 048 576 (1M) | subtree height = 20 |
-| `HASHES_PER_BLOCK` | auto-detected | fills ~80% of system RAM with 1M-leaf subtrees |
+| `HASHES_PER_BLOCK` | auto-detected | fills ~55% of system RAM with 1M-leaf subtrees |
 | Num miners | 3 | competing subtree orderings |
 | Num businesses | 1 000 | distinct callback tokens |
 | Test duration | 10 s | ignored in `-direct` mode |
 | Mock block height | 800 000 | stamped in every BUMP |
 
-For example, on a 36 GB machine the default is 160 subtrees × 1M = **167M txids** (~28.7 GB estimated).
-On a 16 GB machine: ~76 subtrees × 1M = **~80M txids**.
+For example, on a 36 GB machine the default is 64 subtrees × 1M = **67M txids** (~19.5 GB estimated).
+On a 16 GB machine: ~24 subtrees × 1M = **~25M txids**.
 
 ---
 
@@ -172,20 +174,20 @@ The harness auto-detects your system's RAM and runs the largest test that fits i
 ╔══════════════════════════════════════════╗
 ║          STUMPT FINAL SUMMARY            ║
 ╠══════════════════════════════════════════╣
-║  Elapsed:                         7.302s  ║
+║  Elapsed:                         5.836s  ║
 ║  Txids submitted:                2097152  ║
-║  Actual rate:                287215.9/s  ║
+║  Actual rate:                359371.1/s  ║
 ╠══════════════════════════════════════════╣
 ║  Subtrees sealed:                      2  ║
-║  Avg seal time:                 50.45ms  ║
+║  Avg seal time:                 55.38ms  ║
 ║  Proof pre-computations:               2  ║
-║  Avg proof time:               202.36ms  ║
+║  Avg proof time:               216.90ms  ║
 ╠══════════════════════════════════════════╣
-║  Coinbase reseal:              164.42ms  ║
+║  Coinbase reseal:              159.35ms  ║
 ║  Top tree build:                 0.00ms  ║
-║  BUMP assembly ( 100tok):     1329.30ms  ║
+║  BUMP assembly ( 100tok):     1580.10ms  ║
 ║  Callbacks delivered:                200  ║
-║  Avg callback time:            391.34ms  ║
+║  Avg callback time:            462.23ms  ║
 ║  Avg BUMP size:               6673217 B  ║
 ║  Total BUMP bytes:         1334643448 B  ║
 ╚══════════════════════════════════════════╝

@@ -1,12 +1,9 @@
 package merkleservice
 
 import (
-	"bytes"
-	"context"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"runtime"
 	"sort"
@@ -19,23 +16,69 @@ import (
 	"github.com/bsv-blockchain/stumpt/internal/subtree"
 )
 
-// processBUMPs is the entry-point for block-finalization BUMP work.
-// It builds compound BUMPs for all tokens using a parallel worker pool
-// and delivers them via HTTP.
-// If dumpFile is non-empty the first assembled BUMP is written as a hex string.
-func processBUMPs(
-	ctx context.Context,
+// subtreeCache is a bounded LRU-ish cache for loaded subtree data.
+type subtreeCache struct {
+	mu      sync.Mutex
+	entries map[int]*cachedSubtree
+	order   []int // access order for eviction
+	maxSize int   // max entries
+	mc      *metrics.Collector
+}
+
+type cachedSubtree struct {
+	Leaves []chainhash.Hash
+	Store  []chainhash.Hash
+}
+
+func newSubtreeCache(maxEntries int, mc *metrics.Collector) *subtreeCache {
+	return &subtreeCache{
+		entries: make(map[int]*cachedSubtree, maxEntries),
+		order:   make([]int, 0, maxEntries),
+		maxSize: maxEntries,
+		mc:      mc,
+	}
+}
+
+func (sc *subtreeCache) get(si int) *cachedSubtree {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if e, ok := sc.entries[si]; ok {
+		sc.mc.RecordCacheHit()
+		return e
+	}
+	return nil
+}
+
+func (sc *subtreeCache) put(si int, cs *cachedSubtree) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if _, ok := sc.entries[si]; ok {
+		return // already present
+	}
+	// Evict oldest if at capacity.
+	if len(sc.entries) >= sc.maxSize && sc.maxSize > 0 {
+		oldest := sc.order[0]
+		sc.order = sc.order[1:]
+		delete(sc.entries, oldest)
+	}
+	sc.entries[si] = cs
+	sc.order = append(sc.order, si)
+}
+
+// ProcessBUMPs is the entry-point for block-finalization BUMP work.
+// It loads subtrees from disk (with caching), computes proofs JIT, and
+// records BUMP sizes and timing. No HTTP delivery.
+func ProcessBUMPs(
 	blockHeight uint32,
 	subtreeHeight, topTreeHeight, totalHeight int,
 	mc *metrics.Collector,
 	evt *BlockFinalizedEvent,
-	callbackAddr string,
 	dumpFile string,
+	maxCacheEntries int,
 ) {
 	t0 := time.Now()
 
 	// Pre-compute top-tree proofs for every subtree index once.
-	// GetAllProofs builds the merkle store once and returns all n proofs.
 	topProofs, err := subtree.GetAllProofs(evt.SubtreeRoots)
 	if err != nil {
 		slog.Error("top tree proof failed", "err", err)
@@ -48,22 +91,14 @@ func processBUMPs(
 		"duration", time.Since(t0),
 	)
 
-	// Assemble and deliver BUMPs in a streaming pipeline.
-	// Workers build BUMPs and immediately hand them off for delivery,
-	// avoiding accumulating all BUMP byte slices in memory at once.
+	// Build list of all business tokens.
 	t1 := time.Now()
-	type tokenWork struct {
-		token string
-		cb    CallbackInfo
-	}
-	work := make([]tokenWork, 0, len(evt.Callbacks))
-	for token, cb := range evt.Callbacks {
-		work = append(work, tokenWork{token: token, cb: cb})
+	tokens := make([]string, evt.NumBusinesses)
+	for i := 0; i < evt.NumBusinesses; i++ {
+		tokens[i] = fmt.Sprintf("token-%d", i)
 	}
 
-	total := len(work)
-	// Each worker holds one BUMP's worth of maps + serialized bytes in flight.
-	// With streaming delivery, completed BUMPs are freed immediately.
+	total := len(tokens)
 	numWorkers := runtime.GOMAXPROCS(0)
 	if numWorkers > total {
 		numWorkers = total
@@ -75,78 +110,56 @@ func processBUMPs(
 	slog.Info("BUMP assembly starting",
 		"tokens", total,
 		"workers", numWorkers,
+		"cacheSize", maxCacheEntries,
 	)
 
-	// Miner-0 subtrees are already in memory — use them directly.
-	// No disk loading needed for BUMP assembly.
-	type subtreeData struct {
-		Leaves []chainhash.Hash
-		Store  []chainhash.Hash
-	}
-	numSubtrees := len(evt.SubtreeRoots)
+	// Disk-backed subtree loading with bounded cache.
+	cache := newSubtreeCache(maxCacheEntries, mc)
 
-	loadSubtree := func(si int) *subtreeData {
-		if si < 0 || si >= len(evt.Miner0Subtrees) {
+	loadSubtree := func(si int) *cachedSubtree {
+		// Check cache first.
+		if cs := cache.get(si); cs != nil {
+			return cs
+		}
+		mc.RecordCacheMiss()
+
+		// Load from disk.
+		tRead := time.Now()
+		leavesBytes, storeBytes, ok := evt.MinerSubStore.Load(evt.WinnerMiner, si)
+		mc.RecordDiskRead(time.Since(tRead))
+		if !ok {
+			slog.Error("subtree load failed", "miner", evt.WinnerMiner, "subtree", si)
 			return nil
 		}
-		ms := evt.Miner0Subtrees[si]
-		if ms == nil || ms.Leaves == nil {
-			return nil
+		cs := &cachedSubtree{
+			Leaves: bytesToHashSlice(leavesBytes),
+			Store:  bytesToHashSlice(storeBytes),
 		}
-		return &subtreeData{Leaves: ms.Leaves, Store: ms.Store}
-	}
-	slog.Info("miner-0 subtrees ready for BUMP assembly",
-		"subtrees", numSubtrees,
-	)
-
-	type deliveryItem struct {
-		token string
-		cb    CallbackInfo
-		data  []byte
+		cache.put(si, cs)
+		return cs
 	}
 
-	// Streaming pipeline: build workers → delivery channel → delivery workers.
-	deliverCh := make(chan deliveryItem, numWorkers*2)
+	// Worker pool for BUMP assembly.
 	workCh := make(chan int, total)
+	var wg sync.WaitGroup
+	var dumpOnce sync.Once
 
-	// Track progress atomically.
-	var doneCount sync.Mutex
-	done := 0
-	dumped := false
-
-	client := &http.Client{Timeout: 15 * time.Second}
-	blockTime := time.Now()
-
-	// Start delivery workers first.
-	deliveryWorkers := numWorkers
-	if deliveryWorkers > 32 {
-		deliveryWorkers = 32
-	}
-	var deliverWg sync.WaitGroup
-	deliverWg.Add(deliveryWorkers)
-	for w := 0; w < deliveryWorkers; w++ {
-		go func() {
-			defer deliverWg.Done()
-			for item := range deliverCh {
-				deliverBUMP(ctx, client, mc, item.cb, item.token, item.data, blockTime)
-			}
-		}()
-	}
-
-	// Launch build workers.
-	var buildWg sync.WaitGroup
 	for w := 0; w < numWorkers; w++ {
-		buildWg.Add(1)
+		wg.Add(1)
 		go func() {
-			defer buildWg.Done()
+			defer wg.Done()
 			for idx := range workCh {
-				tw := work[idx]
+				token := tokens[idx]
 
-				// On-demand proof computation from cached/loaded subtree stores.
+				// Look up subtree positions for this token.
+				subtreeIdxs := evt.TokenSubtreeIdx.SubtreeIndices(token)
+				if len(subtreeIdxs) == 0 {
+					continue
+				}
+
 				var proofs []*SubtreeProof
-				subtreeIdxs := evt.TokenSubtreeIdx.SubtreeIndices(tw.token)
 				for _, si := range subtreeIdxs {
-					localIdxs := evt.TokenSubtreeIdx.Get(tw.token, si)
+					localIdxs := evt.TokenSubtreeIdx.Get(token, si)
 					if len(localIdxs) == 0 {
 						continue
 					}
@@ -178,34 +191,24 @@ func processBUMPs(
 					subtreeHeight, topTreeHeight, totalHeight,
 				)
 				if err != nil {
-					slog.Error("BUMP build failed", "token", tw.token, "err", err)
+					slog.Error("BUMP build failed", "token", token, "err", err)
 					continue
 				}
 				bumpBytes := bump.Bytes()
+				mc.RecordBUMP(len(bumpBytes))
 
 				// Dump first BUMP if requested.
 				if dumpFile != "" {
-					doneCount.Lock()
-					if !dumped {
-						dumped = true
-						doneCount.Unlock()
-						dumpBUMPHex(dumpFile, tw.token, bumpBytes)
-					} else {
-						doneCount.Unlock()
-					}
+					dumpOnce.Do(func() {
+						dumpBUMPHex(dumpFile, token, bumpBytes)
+					})
 				}
 
-				// Stream to delivery immediately — don't accumulate.
-				deliverCh <- deliveryItem{token: tw.token, cb: tw.cb, data: bumpBytes}
-
 				// Log progress every 10%.
-				doneCount.Lock()
-				done++
-				d := done
-				doneCount.Unlock()
-				if total >= 10 && d%(total/10) == 0 {
+				count := mc.BUMPCount()
+				if total >= 10 && count%(int64(total)/10) == 0 {
 					slog.Info("BUMP assembly progress",
-						"done", d,
+						"done", count,
 						"total", total,
 						"elapsed", time.Since(t1).Round(time.Millisecond),
 					)
@@ -215,12 +218,11 @@ func processBUMPs(
 	}
 
 	// Enqueue work.
-	for i := range work {
+	for i := range tokens {
 		workCh <- i
 	}
 	close(workCh)
-	buildWg.Wait()
-	close(deliverCh)
+	wg.Wait()
 
 	mc.RecordBUMPAssembly(time.Since(t1))
 	slog.Info("BUMPs assembled",
@@ -228,21 +230,10 @@ func processBUMPs(
 		"workers", numWorkers,
 		"assemblyDuration", time.Since(t1),
 	)
-
-	deliverWg.Wait()
 }
 
 // buildCompoundBUMP creates a single MerklePath that covers all of a token's
 // txids in one O(n·h) pass — no repeated Combine calls.
-//
-// Strategy:
-//  1. Accumulate every PathElement from every per-txid proof into a
-//     map[level]map[offset]*PathElement.  Because all proofs share the same
-//     block tree, duplicate offsets at the same level always carry the same
-//     hash, so last-write is fine.
-//  2. Prune intermediate nodes whose both children are already present
-//     (identical to what Combine does internally, but only once).
-//  3. Sort each level by offset and wrap in a MerklePath.
 func buildCompoundBUMP(
 	blockHeight uint32,
 	proofs []*SubtreeProof,
@@ -253,9 +244,6 @@ func buildCompoundBUMP(
 		return nil, fmt.Errorf("buildCompoundBUMP: no proofs")
 	}
 
-	// merged[level][offset] = PathElement
-	// Pre-allocate with estimated capacity: level 0 has ~2× proofs (txid + sibling),
-	// higher levels have ~1 entry per proof (siblings deduplicate).
 	numProofs := len(proofs)
 	merged := make([]map[uint64]*gosdk.PathElement, totalHeight)
 	merged[0] = make(map[uint64]*gosdk.PathElement, numProofs*2)
@@ -263,15 +251,13 @@ func buildCompoundBUMP(
 		merged[i] = make(map[uint64]*gosdk.PathElement, numProofs)
 	}
 
-	// Accumulate all elements from every per-txid proof.
 	for _, proof := range proofs {
 		if err := accumulateProof(proof, topProofs, subtreeHeight, topTreeHeight, totalHeight, merged); err != nil {
 			return nil, err
 		}
 	}
 
-	// Prune: remove a node at level h if both its children (at h-1) are
-	// present — it can be recomputed and is redundant in the BUMP.
+	// Prune: remove a node at level h if both its children (at h-1) are present.
 	for h := totalHeight - 1; h > 0; h-- {
 		for offset := range merged[h] {
 			childL := offset * 2
@@ -284,7 +270,6 @@ func buildCompoundBUMP(
 		}
 	}
 
-	// Build the final [][]*PathElement, sorted by offset per level.
 	path := make([][]*gosdk.PathElement, totalHeight)
 	for h := 0; h < totalHeight; h++ {
 		level := make([]*gosdk.PathElement, 0, len(merged[h]))
@@ -315,18 +300,15 @@ func accumulateProof(
 
 	g := uint64(proof.GlobalIdx) //nolint:gosec
 
-	// Level 0: txid itself + leaf sibling.
 	txidHash := proof.TxID
 	merged[0][g] = &gosdk.PathElement{Offset: g, Hash: &txidHash, Txid: boolPtr(true)}
 	merged[0][g^1] = &gosdk.PathElement{Offset: g ^ 1, Hash: proof.SiblingPath[0]}
 
-	// Subtree levels 1 … subtreeHeight-1.
 	for k := 1; k < subtreeHeight; k++ {
 		sibOffset := (g >> k) ^ 1
 		merged[k][sibOffset] = &gosdk.PathElement{Offset: sibOffset, Hash: proof.SiblingPath[k]}
 	}
 
-	// Top-tree levels subtreeHeight … totalHeight-1.
 	tp := topProofs[si]
 	for k := 0; k < topTreeHeight; k++ {
 		blockLevel := subtreeHeight + k
@@ -337,45 +319,7 @@ func accumulateProof(
 	return nil
 }
 
-// deliverBUMP HTTP-POSTs raw BUMP bytes to the callback URL.
-func deliverBUMP(
-	ctx context.Context,
-	client *http.Client,
-	mc *metrics.Collector,
-	cb CallbackInfo,
-	token string,
-	data []byte,
-	blockTime time.Time,
-) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cb.URL, bytes.NewReader(data))
-	if err != nil {
-		slog.Error("callback: build request", "token", token, "err", err)
-		return
-	}
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("X-Callback-Token", token)
-
-	t0 := time.Now()
-	resp, err := client.Do(req)
-	if err != nil {
-		slog.Error("callback: POST failed", "token", token, "err", err)
-		return
-	}
-	_ = resp.Body.Close()
-
-	latency := time.Since(blockTime)
-	mc.RecordCallback(latency, len(data))
-
-	slog.Info("BUMP delivered",
-		"token", token,
-		"bytes", len(data),
-		"httpMs", time.Since(t0).Milliseconds(),
-		"blockLatency", latency,
-	)
-}
-
 // dumpBUMPHex writes the BUMP binary as a UTF-8 hex string to path.
-// The file contains exactly one line: the lowercase hex-encoded BUMP bytes.
 func dumpBUMPHex(path, token string, data []byte) {
 	if err := os.WriteFile(path, []byte(hex.EncodeToString(data)), 0o644); err != nil {
 		slog.Error("dump-bump: write failed", "path", path, "err", err)

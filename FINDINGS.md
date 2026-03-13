@@ -84,7 +84,7 @@ merkle + indexing + BUMP pipeline.
 | Txids/block | Subtree size | Businesses | Submission rate | Coinbase reseal | BUMP assembly | Avg BUMP | Total bytes |
 |---|---|---|---|---|---|---|---|
 | 1 024     | 64     | 100    | 344k/s      | 0.07 ms  | **0.6 ms**       | 19 KB    | 374 KB   |
-| 2 097 152 | 1M     | 100    | 287k/s      | 164 ms   | **1 329 ms**     | 6.7 MB   | 1.3 GB   |
+| 2 097 152 | 1M     | 100    | 359k/s      | 159 ms   | **1 580 ms**     | 6.7 MB   | 1.3 GB   |
 | 6 000 000 | 10 000 | 1 000  | 128k/s      | 177 ms   | **17.9 s**       | 2.7 MB   | 5.3 GB   |
 | 6 000 000 | 10 000 | 10 000 | 125k/s      | 90 ms    | **13.4 s**       | 336 KB   | 6.7 GB   |
 
@@ -218,21 +218,26 @@ This reduces per-txid memory from ~200B (full proof) to **158B** (64B miner-0 da
 #### Memory budget model
 
 ```
-peak_memory = (hashesPerBlock × 158 B) + 4 GB overhead
+peak_memory = (hashesPerBlock × 280 B) + 2 GB overhead
 ```
 
+**280 B/txid** = 32B ordered list + 100B miner-0 subtrees + 140B Go map
+(`map[chainhash.Hash]string` with bucket overhead) + 4B TokenSubtreeIndex +
+4B amortized temporaries.
+
 The harness auto-detects system RAM and calculates the maximum number of 1M-leaf
-subtrees that fit in 80% of physical memory. The `-max-memory` flag allows
-overriding this budget.
+subtrees that fit in 55% of physical memory. The 55% budget leaves headroom for
+Go GC pressure, OS caches, and temporary allocations during subtree sealing.
+The `-max-memory` flag allows overriding this budget.
 
 | System RAM | Default subtrees | Default txids | Est. peak memory |
 |---|---|---|---|
-| 8 GB | 2 × 1M | 2M | 4.3 GB |
-| 16 GB | 76 × 1M | 80M | 12.4 GB |
-| 32 GB | 140 × 1M | 147M | 25.6 GB |
-| 36 GB | 160 × 1M | 167M | 28.7 GB |
-| 64 GB | 304 × 1M | 319M | 50.8 GB |
-| 128 GB | 624 × 1M | 654M | 100.0 GB |
+| 8 GB | 2 × 1M | 2M | 2.5 GB |
+| 16 GB | 24 × 1M | 25M | 8.6 GB |
+| 32 GB | 56 × 1M | 59M | 17.5 GB |
+| 36 GB | 64 × 1M | 67M | 19.5 GB |
+| 64 GB | 120 × 1M | 126M | 35.4 GB |
+| 128 GB | 248 × 1M | 260M | 70.5 GB |
 
 #### Eviction strategy
 
@@ -342,7 +347,7 @@ HTTP round-trip + context switching). Direct mode bypasses this entirely:
 | HTTP | 1 024 | 204/s | 5.0 s |
 | HTTP | 61 440 | 102/s | 10 min (paced) |
 | Direct | 1 024 | 344k/s | 0.02 s |
-| Direct | 2 097 152 | 287k/s | 7.3 s |
+| Direct | 2 097 152 | 359k/s | 5.8 s |
 | Direct | 6 000 000 | 128k/s | 47 s |
 
 Direct mode reveals the true cost of the merkle pipeline without HTTP noise.
@@ -479,7 +484,7 @@ count** tradeoff.
 | Coinbase reseal cost? | **Negligible** at all scales (0.05 ms to ~164 ms with 1M-leaf subtrees); only one subtree is affected regardless of block size |
 | STUMP indexing? | **XOR-based O(1) insertion + O(subtrees × tokens) discovery** replaces O(tokens × txids) scanning; 23× faster than hash-based keys; scales to 6M probes in 1.7s |
 | Parallel computation? | **2.6× speedup** for parallel merkle tree building; **3-4× speedup** for parallel BUMP assembly on 12 cores |
-| Memory management? | **158 B/txid** with JIT proof computation; auto-detects system RAM; hybrid in-memory + disk-backed storage keeps peak usage bounded |
+| Memory management? | **280 B/txid** measured (Go map overhead dominates); auto-detects system RAM at 55% budget; hybrid in-memory + disk-backed storage keeps peak usage bounded |
 | Direct mode value? | **Eliminates HTTP bottleneck** at >60k txids; enables 287k+ txids/s submission; essential for testing at millions of txids |
 | Feasibility at 5 tx/s? | **Trivially feasible**; total at-block work < 5 ms |
 | Feasibility at 100 tx/s? | **Feasible**; ~33 ms at-block |
@@ -508,9 +513,10 @@ count** tradeoff.
 5. **Coinbase reseal is not a concern.** Even at 1M-leaf subtrees it adds
    only ~164 ms to the critical path.
 
-6. **Memory: 158 B/txid + 4 GB overhead.** At 600M txids this is ~93 GB peak.
+6. **Memory: 280 B/txid + 2 GB overhead.** At 600M txids this is ~164 GB peak.
    The hybrid in-memory/disk approach keeps miner-0 hot data in RAM while
-   evicting cold miner data to BadgerDB. The harness auto-detects system RAM
+   evicting cold miner data to BadgerDB. Go map overhead dominates (140B of
+   the 280B per txid). The harness auto-detects system RAM at 55% budget
    and scales accordingly.
 
 7. **STUMP XOR indexing scales to 6000 subtrees × 100k tokens** on a single

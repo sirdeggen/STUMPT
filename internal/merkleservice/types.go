@@ -5,27 +5,21 @@ import (
 	"github.com/bsv-blockchain/stumpt/internal/diskstore"
 )
 
-// WatchRequest is the JSON body of POST /watch.
-type WatchRequest struct {
-	TxID     string       `json:"txid"`
-	Callback CallbackInfo `json:"callback"`
-}
-
 // CallbackInfo holds the delivery target for a submitting business.
 type CallbackInfo struct {
 	URL   string `json:"url"`
 	Token string `json:"token"`
 }
 
-// SubtreeProof holds a pre-computed miner-0 merkle proof for a single txid.
-// The SiblingPath contains sibling hashes at subtree levels 0 … subtreeHeight-1.
-// At BUMP-assembly time the top-tree levels are appended from the sealed
-// subtree-root list.
+// SubtreeProof holds a merkle proof for a single txid within the winning miner's
+// subtree ordering. The SiblingPath contains sibling hashes at subtree levels
+// 0 … subtreeHeight-1. At BUMP-assembly time the top-tree levels are appended
+// from the sealed subtree-root list.
 type SubtreeProof struct {
 	TxID        chainhash.Hash
 	SubtreeIdx  int               // which of the block's subtrees this txid lives in
-	LocalIdx    int               // position within miner-0's jittered ordering of that subtree
-	GlobalIdx   int               // = SubtreeIdx * HashesPerSubtree + LocalIdx  (miner-0 block offset)
+	LocalIdx    int               // position within the winning miner's ordering of that subtree
+	GlobalIdx   int               // = SubtreeIdx * HashesPerSubtree + LocalIdx
 	SiblingPath []*chainhash.Hash // len = SubtreeHeight
 }
 
@@ -37,20 +31,19 @@ type MinerSubtree struct {
 	Store  []chainhash.Hash // flat merkle-store (internal nodes only)
 }
 
-// BlockFinalizedEvent is sent to the BUMP processor when all txids have arrived.
+// BlockFinalizedEvent is produced at "block found" time and drives BUMP assembly.
 type BlockFinalizedEvent struct {
-	// SubtreeRoots is the ordered list of miner-0 subtree roots.
+	// WinnerMiner is the index of the miner that won the block (0-based).
+	WinnerMiner int
+	// SubtreeRoots is the ordered list of the winning miner's subtree roots.
 	SubtreeRoots []chainhash.Hash
-	// Callbacks maps each token to its callback delivery target.
-	Callbacks map[string]CallbackInfo
-	// TokenSubtreeIdx is the lightweight index of token → (subtreeIdx → []localIdx).
+	// TokenSubtreeIdx is the winning miner's token→(subtreeIdx→[]localIdx) index.
 	// BUMP assembly uses this to find leaf positions, then computes proofs JIT.
 	TokenSubtreeIdx *TokenSubtreeIndex
-	// Miner0Subtrees holds the in-memory miner-0 subtree data (leaves + store).
-	// BUMP assembly reads directly from these instead of loading from disk.
-	Miner0Subtrees []*MinerSubtree
-	// MinerSubStore provides disk-backed access to non-miner-0 subtree data.
+	// MinerSubStore provides disk-backed loading of subtree data.
 	MinerSubStore *diskstore.MinerSubtreeStore
 	// HashesPerSubtree is needed to compute GlobalIdx from (subtreeIdx, localIdx).
 	HashesPerSubtree int
+	// NumBusinesses is the total number of business tokens.
+	NumBusinesses int
 }
