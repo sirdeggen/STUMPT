@@ -9,7 +9,7 @@
 | **BUMP** | Bitcoin UTXO Merkle Path (BRC-74). A compact binary proof that one or more txids are included in a block. |
 | **Compound BUMP** | A single BUMP covering all of a business's txids. Shared intermediate nodes are pruned. |
 | **Subtree** | A fixed-size partition of the block's transactions (default: 1M leaves). Each subtree has its own merkle tree. |
-| **STUMP** | **S**ub**T**ree **U**nified **M**erkle **P**ath. A pre-computed fragment of a compound BUMP covering one token's txids within one subtree. |
+| **STUMP** | **S**ub**T**ree **U**nified **M**erkle **P**ath. A pre-computed fragment of a compound BUMP covering one business's txids within one subtree. |
 | **Fragment** | Serialized STUMP data stored to disk (~82 KB). Contains deduped BUMP entries for subtree levels only. |
 | **Top tree** | The merkle tree built from subtree roots. Stitches subtrees together into the full block merkle tree. |
 | **Token** | A business identifier. Each txid maps to exactly one token via `uint64(txid[:8]) % NumBusinesses`. |
