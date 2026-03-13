@@ -2,7 +2,7 @@ package merkleservice
 
 import (
 	"github.com/bsv-blockchain/go-sdk/chainhash"
-	"github.com/bsv-blockchain/stumpt/internal/stump"
+	"github.com/bsv-blockchain/stumpt/internal/diskstore"
 )
 
 // WatchRequest is the JSON body of POST /watch.
@@ -43,9 +43,12 @@ type BlockFinalizedEvent struct {
 	SubtreeRoots []chainhash.Hash
 	// Callbacks maps each token to its callback delivery target.
 	Callbacks map[string]CallbackInfo
-	// StumpStore provides on-demand access to per-token proofs via XOR probing.
-	// BUMP assembly queries this directly rather than copying all proofs.
-	StumpStore stump.StumpStore
-	// TokenReg provides token→hash mappings for XOR key computation.
-	TokenReg *stump.TokenRegistry
+	// TokenSubtreeIdx is the lightweight index of token → (subtreeIdx → []localIdx).
+	// BUMP assembly uses this to find leaf positions, then reloads merkle stores
+	// from disk to compute proofs just-in-time.
+	TokenSubtreeIdx *TokenSubtreeIndex
+	// MinerSubStore provides disk-backed access to subtree leaves/stores.
+	MinerSubStore *diskstore.MinerSubtreeStore
+	// HashesPerSubtree is needed to compute GlobalIdx from (subtreeIdx, localIdx).
+	HashesPerSubtree int
 }

@@ -16,7 +16,6 @@ import (
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	gosdk "github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/bsv-blockchain/stumpt/internal/metrics"
-	"github.com/bsv-blockchain/stumpt/internal/stump"
 	"github.com/bsv-blockchain/stumpt/internal/subtree"
 )
 
@@ -63,12 +62,9 @@ func processBUMPs(
 	}
 
 	total := len(work)
-	// Limit BUMP assembly concurrency to cap peak memory.
-	// Each worker holds a full BUMP's worth of maps + serialized bytes.
+	// Each worker holds one BUMP's worth of maps + serialized bytes in flight.
+	// With streaming delivery, completed BUMPs are freed immediately.
 	numWorkers := runtime.GOMAXPROCS(0)
-	if numWorkers > 4 {
-		numWorkers = 4 // cap to avoid OOM from concurrent large BUMPs
-	}
 	if numWorkers > total {
 		numWorkers = total
 	}
@@ -80,6 +76,38 @@ func processBUMPs(
 		"tokens", total,
 		"workers", numWorkers,
 	)
+
+	// Pre-load all miner-0 subtree stores into memory for fast BUMP assembly.
+	// At 600 subtrees × ~64MB each this is ~38GB — may need to be bounded.
+	type subtreeCache struct {
+		Leaves []chainhash.Hash
+		Store  []chainhash.Hash
+	}
+	numSubtrees := len(evt.SubtreeRoots)
+	stCache := make([]subtreeCache, numSubtrees)
+	{
+		var cacheWg sync.WaitGroup
+		cacheWg.Add(numSubtrees)
+		for si := 0; si < numSubtrees; si++ {
+			go func(si int) {
+				defer cacheWg.Done()
+				leavesBytes, storeBytes, ok := evt.MinerSubStore.Load(0, si)
+				if !ok {
+					slog.Error("BUMP cache: failed to load subtree", "subtreeIdx", si)
+					return
+				}
+				stCache[si] = subtreeCache{
+					Leaves: bytesToHashSlice(leavesBytes),
+					Store:  bytesToHashSlice(storeBytes),
+				}
+			}(si)
+		}
+		cacheWg.Wait()
+		slog.Info("subtree cache loaded",
+			"subtrees", numSubtrees,
+			"estMemoryMB", numSubtrees*64,
+		)
+	}
 
 	type deliveryItem struct {
 		token string
@@ -124,19 +152,30 @@ func processBUMPs(
 			for idx := range workCh {
 				tw := work[idx]
 
-				// On-demand discovery: probe stump store for this token's entries.
-				th, _ := evt.TokenReg.Hash(tw.token)
+				// On-demand proof computation from cached subtree stores.
 				var proofs []*SubtreeProof
-				for _, root := range evt.SubtreeRoots {
-					key := stump.XORKey(th, root)
-					entries := evt.StumpStore.Get(key)
-					for _, e := range entries {
+				subtreeIdxs := evt.TokenSubtreeIdx.SubtreeIndices(tw.token)
+				for _, si := range subtreeIdxs {
+					localIdxs := evt.TokenSubtreeIdx.Get(tw.token, si)
+					if len(localIdxs) == 0 || si >= len(stCache) {
+						continue
+					}
+					sc := &stCache[si]
+					if sc.Leaves == nil {
+						continue
+					}
+					for _, li32 := range localIdxs {
+						li := int(li32)
+						sp, err := subtree.GetProofFromStore(sc.Leaves, sc.Store, li)
+						if err != nil {
+							continue
+						}
 						proofs = append(proofs, &SubtreeProof{
-							TxID:        e.TxID,
-							SubtreeIdx:  e.SubtreeIdx,
-							LocalIdx:    e.LocalIdx,
-							GlobalIdx:   e.GlobalIdx,
-							SiblingPath: e.SiblingPath,
+							TxID:        sc.Leaves[li],
+							SubtreeIdx:  si,
+							LocalIdx:    li,
+							GlobalIdx:   si*evt.HashesPerSubtree + li,
+							SiblingPath: sp,
 						})
 					}
 				}
