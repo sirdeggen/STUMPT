@@ -18,10 +18,15 @@ The theory being tested here is a **subtree-based incremental approach**:
 2. Each subtree's internal merkle tree is built as soon as the subtree is sealed — spreading the work evenly across the inter-block interval.
 3. All miners build their own subtrees (with jittered orderings) and **store them to disk** via BadgerDB.
 4. A lightweight **TokenSubtreeIndex** records which business tokens have txids in each subtree and their leaf positions (4 bytes/entry).
-5. When the block is found, a random miner wins. The winner's subtrees are **loaded from disk** with a bounded LRU cache, a small **top tree** is built, and proofs are computed **just-in-time**.
-6. Each subscribing business receives a single **compound BUMP** that covers all of their transactions at once.
+5. **STUMP fragments** (per-token, per-subtree BUMP proof data) are pre-computed during sealing while the merkle store is in memory, and stored to disk. This moves the expensive proof extraction into Phase 2 instead of the critical path.
+6. When the block is found, a random miner wins. The coinbase is revealed, subtree-0 is resealed (and its fragments re-extracted), a small **top tree** is built, and **pre-computed fragments are loaded** (~82 KB each instead of 64 MB full subtrees) to assemble final BUMPs.
+7. Each subscribing business receives a single **compound BUMP** that covers all of their transactions at once.
 
 This repo simulates that pipeline end-to-end across 4 phases and measures the timing of each.
+
+See also:
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** — Storage formats, key layouts, data flow diagrams, fragment encoding, and size calculations
+- **[FINDINGS.md](FINDINGS.md)** — Benchmark results, scale projections, feasibility analysis from 5 tx/s to 1M tx/s
 
 ---
 
@@ -83,54 +88,54 @@ Phase 4: Block found → load from disk → assemble BUMPs (critical path)
 
 ### Phase 1 — Txid Generation
 
-Generate `HashesPerBlock` random 32-byte hashes into a `[]chainhash.Hash` slice. Each txid is associated with a business token round-robin: `token-{i % NumBusinesses}`. Parallel generation across all CPU cores.
+Generate `HashesPerBlock` random 32-byte hashes into a `[]chainhash.Hash` slice. Each txid is associated with a business token derived from the txid hash itself: `token-{uint64(txid[:8]) % NumBusinesses}`. This gives uniform, order-independent random assignment. Parallel generation across all CPU cores.
 
 **Metric:** generation rate (txids/sec), total time.
 
-### Phase 2 — Miner Subtree Sealing (to disk)
+### Phase 2 — Miner Subtree Sealing + STUMP Fragment Pre-computation
 
 For each subtree boundary (every `HashesPerSubtree` txids):
 - Slice base txids from the Phase 1 list
 - For each miner (in parallel): jitter txids, `BuildMerkleStore()`, save leaves+store to BadgerDB
+- Build per-miner `TokenSubtreeIndex` entries (derive token from txid hash)
+- **Extract STUMP fragments:** for each token's txids in this subtree, compute the subtree-level BUMP entries (levels 0..subtreeHeight-1) using bitset dedup, and store the serialized fragment to disk (~82 KB per token per subtree)
 - Free in-memory subtree data immediately after saving to disk
-- Build per-miner `TokenSubtreeIndex` entries (derive token from global arrival index)
 - Record subtree roots per miner
 
 After all subtrees are sealed, the Phase 1 txid list is freed.
 
-**Key insight:** Token is derived from `globalIndex % NumBusinesses` — this eliminates the 140B/txid `MemTxIDIndex` that dominated the old memory model.
+**Key insight:** Token is derived from the txid hash — deterministic, order-independent, and uniform. STUMP fragments are extracted while the merkle store is in memory, avoiding the need to reload 64 MB subtrees during Phase 4.
 
 **Metric:** seal+write rate (subtrees/sec), avg seal time, avg disk write time.
 
 ### Phase 3 — Token Index (integrated into Phase 2)
 
-The `TokenSubtreeIndex` is built during Phase 2 as each subtree is sealed. It records `(token, subtreeIdx) → []int32 localIdx` for every miner. At 4B per entry per miner, this is the lightweight STUMP.
+The `TokenSubtreeIndex` is built during Phase 2 as each subtree is sealed. It records `(token, subtreeIdx) → []int32 localIdx` for every miner. At 4B per entry per miner, this is the lightweight index that Phase 4 uses to know which fragments to load.
 
 ### Phase 4 — Block Found (critical path, timed)
 
 Timer starts. A random miner wins.
 
-1. **Coinbase reseal:** Load winner's subtree-0 from disk, replace coinbase placeholder, rebuild store, save back.
+1. **Coinbase reseal:** Load winner's subtree-0 from disk, replace coinbase placeholder, rebuild store, save back. Re-extract STUMP fragments for all tokens in subtree-0.
 2. **Top-tree build:** Build merkle tree from winner's subtree roots.
 3. **BUMP assembly:** For each business token:
    - Look up subtree indices from winner's `TokenSubtreeIndex`
-   - Load winner's subtrees from disk (with bounded LRU cache)
-   - Compute proofs JIT from loaded stores
-   - Assemble compound BUMP via `buildCompoundBUMP()`
+   - Load pre-computed STUMP fragments from disk (~82 KB each, vs 64 MB full subtrees)
+   - Deserialize fragment entries, add top-tree proof levels, prune, serialize BRC-74 binary
    - Record BUMP size and assembly time
 
 Non-winner `TokenSubtreeIndex` data is freed at the start of this phase.
 
-**Metric:** total critical-path time, coinbase reseal, top tree build, BUMP assembly time, per-token BUMP size, cache hit/miss rate.
+**Metric:** total critical-path time, coinbase reseal, top tree build, BUMP assembly time, per-token BUMP size, fragment load rate.
 
 ### Storage strategy
 
 | Data | Storage | Why |
 |------|---------|-----|
 | Ordered txid list | **In-memory** (Phase 1-2) | Pre-allocated to block size; freed after sealing |
-| All miners' subtree leaves + stores | **BadgerDB (disk)** | Stored immediately after sealing; loaded on demand during BUMP assembly |
-| TokenSubtreeIndex (all miners) | **In-memory** | Lightweight (4B/entry/miner); accessed during BUMP assembly |
-| Subtree cache (Phase 4) | **In-memory, bounded** | LRU cache fills remaining memory budget |
+| All miners' subtree leaves + stores | **BadgerDB (disk)** | Stored immediately after sealing; used as fallback if fragments unavailable |
+| STUMP fragments (per token × subtree) | **BadgerDB (disk)** | Pre-computed during Phase 2; ~82 KB each (vs 64 MB full subtree) |
+| TokenSubtreeIndex (all miners) | **In-memory** | Lightweight (4B/entry/miner); maps tokens to subtrees for fragment lookup |
 
 ### Subtree / Merkle Engine (`internal/subtree`)
 - Implements `BuildMerkleStore` and `GetMerkleProof` using `go-sdk/chainhash` only.
@@ -147,7 +152,10 @@ Non-winner `TokenSubtreeIndex` data is freed at the start of this phase.
 ### Disk Store (`internal/diskstore`)
 - BadgerDB v4 LSM-tree for persistent key-value storage.
 - `MinerSubtreeStore`: saves/loads subtree leaves and merkle stores for all miners.
-- Key format: `'m' + minerIdx(4B) + subtreeIdx(4B) + type('L'|'S')`.
+  Key format: `'m' + minerIdx(4B) + subtreeIdx(4B) + type('L'|'S')`.
+- `FragmentStore`: saves/loads pre-computed STUMP fragments per (miner, token, subtree).
+  Key format: `'f' + minerIdx(4B) + tokenIdx(4B) + subtreeIdx(4B)`.
+  Each fragment is ~82 KB containing deduped BUMP entries for subtree levels.
 
 ---
 
@@ -196,30 +204,32 @@ The harness auto-detects your system's RAM and runs the largest test that fits i
 ╔══════════════════════════════════════════════╗
 ║            STUMPT FINAL SUMMARY              ║
 ╠══════════════════════════════════════════════╣
-║  Total elapsed:                     4.676s  ║
+║  Total elapsed:                     7.672s  ║
 ║  Total txids:                      2097152  ║
 ╠══════════════════════════════════════════════╣
-║  PHASE 1 — Generation                1296ms  ║
-║    Rate:                        1617691/s  ║
+║  PHASE 1 — Generation                1442ms  ║
+║    Rate:                        1454291/s  ║
 ╠══════════════════════════════════════════════╣
-║  PHASE 2 — Seal + Index              1966ms  ║
+║  PHASE 2 — Seal + Index              5254ms  ║
 ║    Subtrees sealed:                      2  ║
-║    Avg seal time:                   49.68ms  ║
+║    Avg seal time:                   53.52ms  ║
 ║    Disk writes:                          2  ║
-║    Avg disk write:                 215.49ms  ║
+║    Avg disk write:                  86.16ms  ║
 ╠══════════════════════════════════════════════╣
-║  PHASE 4 — Block Found               1371ms  ║
-║    Coinbase reseal:                 49.03ms  ║
+║  PHASE 4 — Block Found                934ms  ║
+║    Coinbase reseal:                729.81ms  ║
 ║    Top tree build:                   0.00ms  ║
-║    BUMP assembly ( 100tok):       1321.62ms  ║
-║    Disk reads:                          12  ║
-║    Avg disk read:                   15.93ms  ║
-║    Cache hits/misses:         188 /     12  ║
+║    BUMP assembly ( 100tok):        196.01ms  ║
+║    Disk reads:                         200  ║
+║    Avg disk read:                    1.11ms  ║
+║    Cache hits/misses:         200 /      0  ║
 ║    BUMPs assembled:                    100  ║
-║    Avg BUMP size:                6673217 B  ║
-║    Total BUMP bytes:           667321724 B  ║
+║    Avg BUMP size:                6250467 B  ║
+║    Total BUMP bytes:           625046778 B  ║
 ╚══════════════════════════════════════════════╝
 ```
+
+Phase 2 is longer because it now pre-computes STUMP fragments for every token in every subtree. Phase 4 BUMP assembly is dramatically faster: fragments are ~82 KB each (vs 64 MB full subtrees), giving 100% cache hits and eliminating the merkle store traversal entirely.
 
 ### 3. Constrained memory budget
 
@@ -304,6 +314,8 @@ Key tests:
 | `subtree` | `TestGetAllProofs` | Batch proof generation matches single-proof generation |
 | `subtree` | `TestCompoundBUMPAcrossSubtrees` | 4 subtrees × 4 leaves: compound BUMPs verify against block root |
 | `subtree` | `TestCompoundBUMPDefaultConfig` | 61,440-txid / 60-subtree / 16-level tree: sample compound BUMPs verify |
+| `merkleservice` | `TestFastVsLegacyBUMP` | Bitset-based fast path produces byte-identical BUMPs to legacy map-based path |
+| `merkleservice` | `TestFragmentVsJIT` | Fragment-based assembly produces byte-identical BUMPs to JIT assembly |
 
 ---
 

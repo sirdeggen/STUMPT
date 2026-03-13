@@ -55,31 +55,37 @@ Seven decisions need real numbers:
 ### 2a. 4-phase pipeline — measured results
 
 All runs on Apple M3 Pro, 36 GB RAM.  Subtrees stored to disk for all miners.
-Winner selected randomly at block-found time.
+Winner selected randomly at block-found time. Token assignment: hash-derived
+from txid (`uint64(txid[:8]) % NumBusinesses`) — random, order-independent.
 
-| Txids/block | Subtree size | Businesses | Phase 1 (gen) | Phase 2 (seal+disk) | Phase 4 (block found) | Coinbase reseal | BUMP assembly | Avg BUMP | Total bytes |
+| Txids/block | Subtree size | Businesses | Phase 1 (gen) | Phase 2 (seal+frags) | Phase 4 (block found) | Coinbase reseal | BUMP assembly | Avg BUMP | Total bytes |
 |---|---|---|---|---|---|---|---|---|---|
-| 1 024     | 64     | 10     | 1 ms       | 2 ms        | **1 ms**       | 0.05 ms  | 0.7 ms       | 19 KB    | 187 KB   |
-| 2 097 152 | 1M     | 100    | 1 296 ms   | 1 966 ms    | **1 371 ms**   | 49 ms    | 1 322 ms     | 6.7 MB   | 667 MB   |
+| 1 024     | 64     | 10     | 1 ms       | 8 ms        | **3 ms**       | 0.44 ms  | 0.99 ms      | 16 KB    | 164 KB   |
+| 2 097 152 | 1M     | 100    | 1 442 ms   | 5 254 ms    | **934 ms**     | 730 ms   | 196 ms       | 6.3 MB   | 625 MB   |
+
+Phase 2 is longer than earlier measurements because it now pre-computes STUMP
+fragments (~82 KB per token per subtree) alongside leaves and stores. Phase 4
+BUMP assembly is dramatically faster: loading ~82 KB fragments instead of 64 MB
+full subtrees eliminates merkle store traversal entirely.
 
 ### 2b. Disk I/O measurements
 
 | Operation | Subtree size | Time | Notes |
 |---|---|---|---|
-| Write (3 miners × 1 subtree) | 1M leaves | **215 ms** | Leaves + store serialized as flat bytes |
-| Read (1 subtree, cache miss) | 1M leaves | **16 ms** | ValueCopy from BadgerDB |
-| Read (cache hit) | any | **< 0.01 ms** | Already in LRU cache |
+| Write (3 miners × 1 subtree + fragments) | 1M leaves | **86 ms** | Leaves + store + STUMP fragments |
+| Read (1 fragment, BadgerDB) | ~82 KB | **1.1 ms** | Per-token per-subtree fragment |
+| Read (1 full subtree, cache miss) | 1M leaves | **16 ms** | Fallback JIT path only |
 
-### 2c. Cache effectiveness
+### 2c. Fragment-based assembly (Phase 4)
 
-| Subtrees | Businesses | Cache entries | Hits | Misses | Hit rate |
+| Subtrees | Businesses | Fragment loads | Avg fragment read | Cache hits | BUMP assembly |
 |---|---|---|---|---|---|
-| 16 | 10 | 16 (all fit) | 140 | 20 | 87.5% |
-| 2  | 100 | 2 (all fit) | 188 | 12 | 94.0% |
+| 16 | 10 | 158 | 0.02 ms | 100% | 0.99 ms |
+| 2  | 100 | 200 | 1.11 ms | 100% | 196 ms |
 
-When all subtrees fit in cache, most business tokens share subtrees and get
-cache hits. The bounded LRU cache prevents memory blowup at large scale while
-maintaining high hit rates because businesses' txids cluster across subtrees.
+STUMP fragments are small enough (~82 KB) that BadgerDB's block cache
+provides 100% hit rate for all fragment loads. Compare to the JIT path
+which loads 64 MB subtrees and relies on a bounded LRU cache (87–94% hit rate).
 
 ### 2d. Pure merkle computation benchmarks (`go test -bench`)
 
@@ -98,20 +104,23 @@ numbers needed to project to 600 M txids/block.
 
 ### 2e. BUMP assembly benchmarks (isolated, `go test -bench`)
 
-These measure `buildCompoundBUMP` in isolation — the per-token compound BUMP
-construction cost without disk I/O or token lookup overhead.
+Three implementations measured: legacy `buildCompoundBUMP` (map-based),
+`assembleTokenBUMPFast` (bitset dedup, JIT), and fragment-based assembly.
 
-| Proofs/token | Subtrees | buildCompoundBUMP | Allocs |
-|---|---|---|---|
-| 10     | 16     | **8.6 us**   | 203        |
-| 600    | 60     | **380 us**   | 11 603     |
-| 6 000  | 600    | **5.2 ms**   | 138 372    |
-| 60 000 | 6 000  | **64 ms**    | 1 561 593  |
+| Proofs/token | Subtrees | Legacy (map) | Fast (bitset) | Allocs (legacy → fast) |
+|---|---|---|---|---|
+| 10     | 16     | **7.2 us**   | **6.5 us**   | 200 → 80       |
+| 600    | 60     | **332 us**   | **98 us**    | 11.5K → 130    |
+| 6 000  | 600    | **4.4 ms**   | **1.2 ms**   | 138K → 214     |
 
-**Key insight:** BUMP assembly per token scales linearly with proofs/token.
-At 60k proofs/token (the 10k tx/s × 100 businesses case), assembly takes 64
-ms per token. With 100 tokens across 12 parallel workers, total assembly is
-~533 ms. With 1000 tokens and 12 workers, ~5.3 s.
+**Key insight:** The bitset-based fast path is 3.7× faster than legacy at
+6K proofs/token with 647× fewer allocations. At production scale (218K
+txids/token), the speedup is expected to be 10-20× due to L3 cache miss
+elimination.
+
+The fragment-based path adds deserialization overhead but eliminates the
+merkle store traversal entirely — at large scale this is the dominant win
+since fragments are ~82 KB vs 64 MB full subtrees.
 
 ---
 
@@ -182,15 +191,17 @@ and a `map[chainhash.Hash]string` txid→token index in memory. This cost
 **280 B/txid** — Go map overhead alone consumed 140 B per entry. On a 36 GB
 machine, only ~63M txids fit in 55% of RAM.
 
-#### The new solution: disk-backed subtrees + derived tokens
+#### The new solution: disk-backed subtrees + STUMP fragments + derived tokens
 
 The phased pipeline eliminates both memory hogs:
 
-1. **All subtrees stored to disk** via BadgerDB immediately after sealing. No miner's data stays in RAM. During BUMP assembly, a bounded LRU cache loads subtrees on demand.
+1. **All subtrees stored to disk** via BadgerDB immediately after sealing. No miner's data stays in RAM.
 
-2. **Token derived from arrival index**: `token = "token-" + (globalIndex % NumBusinesses)`. This eliminates the `MemTxIDIndex` entirely — no 140 B/txid map.
+2. **STUMP fragments pre-computed during Phase 2:** for each token's txids in each subtree, the subtree-level BUMP entries (levels 0..subtreeHeight-1) are extracted while the merkle store is in memory and serialized to disk (~82 KB per fragment). During Phase 4, these fragments replace full 64 MB subtree loads.
 
-3. **TokenSubtreeIndex** (~10 B/entry/miner): records `(token, subtreeIdx) → []int32 localIdx`. Lightweight, kept in memory for all miners during sealing, then only the winner's index is kept for Phase 4.
+3. **Token derived from txid hash**: `token = "token-" + (uint64(txid[:8]) % NumBusinesses)`. This is deterministic, order-independent (same result regardless of miner ordering), and gives uniform random distribution. It eliminates the `MemTxIDIndex` entirely — no 140 B/txid map.
+
+4. **TokenSubtreeIndex** (~10 B/entry/miner): records `(token, subtreeIdx) → []int32 localIdx`. Lightweight, kept in memory for all miners during sealing, then only the winner's index is kept for Phase 4.
 
 #### Memory budget model
 
@@ -360,14 +371,20 @@ Each 1M-leaf subtree on disk requires:
 - Merkle store: ~1M × 32 B = 32 MB (internal nodes)
 - Total: **~64 MB per miner per subtree**
 
-| tx/s | Subtrees | Miners | Disk usage |
-|---|---|---|---|
-| 3.5 (2M txids) | 2 | 3 | **384 MB** |
-| 100 (60M txids) | 58 | 3 | **11 GB** |
-| 1 000 (600M txids) | 572 | 3 | **110 GB** |
+STUMP fragments add:
+- ~82 KB per token per subtree (deduped BUMP entries, 41 bytes/entry)
+- At 1000 businesses: ~82 KB × 1000 = **~82 MB per miner per subtree**
+
+| tx/s | Subtrees | Miners | Subtree data | Fragment data | Total disk |
+|---|---|---|---|---|---|
+| 3.5 (2M txids) | 2 | 3 | 384 MB | 492 MB | **~0.9 GB** |
+| 100 (60M txids) | 58 | 3 | 11 GB | 14 GB | **~25 GB** |
+| 1 000 (600M txids) | 572 | 3 | 110 GB | 141 GB | **~251 GB** |
 
 SSD storage is cheap and fast enough for this workload. BadgerDB's LSM-tree
-architecture handles sequential writes efficiently.
+architecture handles sequential writes efficiently. Fragment storage roughly
+doubles total disk usage but eliminates full subtree loads during Phase 4,
+replacing 64 MB reads with 82 KB reads.
 
 ---
 
@@ -379,7 +396,7 @@ architecture handles sequential writes efficiently.
 | Minimum businesses? | **2 or more** sharing a Merkle Service benefits from subtree reuse; not sensitive to count |
 | Coinbase reseal cost? | **49–164 ms** at 1M-leaf subtrees (includes disk load + rebuild + save); small fraction of total |
 | Memory at scale? | **80 B/txid** with disk-backed subtrees + GC headroom (was 280 B/txid); 36 GB machine handles **~210M txids** (was 63M); `GOMEMLIMIT` enforces budget |
-| Disk I/O cost? | **215 ms write, 16 ms read** per 1M-leaf subtree; 87–94% cache hit rate during BUMP assembly |
+| Disk I/O cost? | **86 ms write** (subtree + fragments); **1.1 ms read** per fragment (82 KB); 100% cache hit rate with STUMP fragments |
 | Competitive mining? | **All miners treated equally**; random winner; no optimization for a specific miner |
 | Parallel computation? | **2.6× merkle speedup**; embarrassingly parallel BUMP assembly and subtree sealing |
 | Feasibility at 5 tx/s? | **Trivially feasible**; total Phase 4 < 5 ms |
@@ -401,9 +418,9 @@ architecture handles sequential writes efficiently.
 3. **12+ cores dedicated to merkle computation.** Subtree sealing, merkle tree
    building, and BUMP assembly all parallelise (measured 2.6–4× on 12 cores).
 
-4. **SSD storage for subtree data.** At 600M txids × 3 miners × ~64 MB per
-   subtree, disk usage is ~110 GB. Write latency must be < 300 ms per subtree
-   to keep up with the sealing rate.
+4. **SSD storage for subtree data + STUMP fragments.** At 600M txids × 3 miners,
+   subtree data is ~110 GB and STUMP fragments add ~141 GB, totalling ~251 GB.
+   Write latency must be < 300 ms per subtree to keep up with the sealing rate.
 
 5. **Coinbase reseal is not a concern.** Even at 1M-leaf subtrees it adds
    only ~50–164 ms to the critical path.
@@ -415,10 +432,11 @@ architecture handles sequential writes efficiently.
    `debug.FreeOSMemory()` releases pages between phases. The harness
    auto-detects system RAM at 55% budget.
 
-7. **Bounded LRU cache for BUMP assembly.** Each 1M-leaf subtree requires
-   ~66 MB in memory when loaded. The cache budget conservatively accounts for
-   GC residual from Phase 2 (~2 GB), winner's TokenSubtreeIndex, BUMP worker
-   memory, and overhead.
+7. **STUMP fragments for BUMP assembly.** Pre-computed during Phase 2, each
+   fragment is ~82 KB — small enough that BadgerDB's block cache provides 100%
+   hit rate. This eliminates the bounded LRU subtree cache (which loaded 64 MB
+   per miss) and the merkle store traversal entirely. A JIT fallback path
+   with LRU cache remains for configurations without fragment pre-computation.
 
 The subtree-based incremental approach **successfully moves the overwhelming
 majority of merkle computation out of the post-block critical window** at all
