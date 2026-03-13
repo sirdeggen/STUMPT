@@ -190,34 +190,63 @@ The phased pipeline eliminates both memory hogs:
 
 2. **Token derived from arrival index**: `token = "token-" + (globalIndex % NumBusinesses)`. This eliminates the `MemTxIDIndex` entirely — no 140 B/txid map.
 
-3. **TokenSubtreeIndex** (4 B/entry/miner): records `(token, subtreeIdx) → []int32 localIdx`. Lightweight, kept in memory for all miners during sealing, then only the winner's index is kept for Phase 4.
+3. **TokenSubtreeIndex** (~10 B/entry/miner): records `(token, subtreeIdx) → []int32 localIdx`. Lightweight, kept in memory for all miners during sealing, then only the winner's index is kept for Phase 4.
 
 #### Memory budget model
 
 ```
-Phase 2 peak = (hashesPerBlock × 48 B) + 1 GB overhead
-Phase 4 peak = (hashesPerBlock × 4 B) + cache + 1 GB overhead
+Phase 2 peak = (hashesPerBlock × 80 B) + 3 GB overhead
+Phase 4 peak = (hashesPerBlock × 10 B) + cache + 3 GB overhead + 2 GB GC residual
 ```
 
-**48 B/txid (Phase 2)** = 32 B ordered list + 4 B × 3 miners TokenSubtreeIndex + 4 B temp.
+**80 B/txid (Phase 2)** = 32 B ordered list + 30 B TokenSubtreeIndex for 3 miners
+(10 B each: 4 B int32 + 6 B slice growth / map overhead) + 18 B Go GC headroom
+(per-subtree temporaries are ~550 MB per iteration; GC retains 1-2 iterations).
 
-**4 B/txid (Phase 4)** = winner's TokenSubtreeIndex only. The txid list is freed.
+**10 B/txid (Phase 4)** = winner's TokenSubtreeIndex with map overhead. The txid
+list and non-winner indexes are freed. `debug.FreeOSMemory()` forces OS page
+reclamation between phases.
+
+**3 GB overhead** = BadgerDB (~500 MB) + Go runtime (~500 MB) + GC-retained
+temporaries (~1-2 GB) + BUMP workers (~600 MB).
+
+The harness sets `debug.SetMemoryLimit` to the budget, which makes Go's GC
+trigger more aggressively as the heap approaches the limit rather than defaulting
+to the GOGC=100 "double the live set" heuristic.
 
 | System RAM | Budget (55%) | Max txids (Phase 2) | Max txids (old 280B model) | Improvement |
 |---|---|---|---|---|
-| 8 GB | 4.4 GB | **70M** | 8.6M | **8×** |
-| 16 GB | 8.8 GB | **162M** | 24M | **7×** |
-| 36 GB | 19.8 GB | **391M** | 63M | **6×** |
-| 64 GB | 35.2 GB | **712M** | 118M | **6×** |
-| 128 GB | 70.4 GB | **1.4B** | 244M | **6×** |
+| 8 GB | 4.4 GB | **17M** | 8.6M | **2×** |
+| 16 GB | 8.8 GB | **72M** | 24M | **3×** |
+| 36 GB | 19.8 GB | **210M** | 63M | **3.3×** |
+| 64 GB | 35.2 GB | **402M** | 118M | **3.4×** |
+| 128 GB | 70.4 GB | **842M** | 244M | **3.5×** |
 
 #### Disk I/O tradeoff
 
 Storing subtrees to disk adds write latency during Phase 2 (~215 ms per 1M-leaf
 subtree for 3 miners) and read latency during Phase 4 (~16 ms per cache miss).
 But the LRU cache means most subtree loads during BUMP assembly are cache hits
-(87–94% measured), so the disk penalty is small relative to the 6× scale
-improvement.
+(87–94% measured), so the disk penalty is modest relative to the scale improvement.
+
+#### Why previous estimates were wrong
+
+The 48 B/txid model underestimated actual memory by ~2× because it accounted
+only for the raw data (32 B txid + 4 B × 3 miners + 4 B temp) without accounting
+for three hidden costs:
+
+1. **Go GC headroom**: with GOGC=100, Go keeps the heap at ~2× live data. Per-subtree
+   temporaries (jitter copies, merkle stores, `localIdx` maps, byte serializations)
+   total ~550 MB per iteration. GC retains 1-2 iterations before collecting.
+
+2. **Map and slice overhead**: `TokenSubtreeIndex` uses `map[string]map[int][]int32`.
+   The `append` growth strategy over-allocates slices by ~50%, and the inner
+   `map[int][]int32` has bucket overhead beyond the raw 4 B per `int32`.
+
+3. **macOS MADV_FREE**: on macOS, freed pages remain as RSS until the OS is
+   under memory pressure. Phase 4's cache allocations stack on top of Phase 2's
+   freed-but-not-reclaimed pages. Fix: `debug.FreeOSMemory()` forces
+   `MADV_DONTNEED` to actually release pages.
 
 ### 3.5 Competitive mining — all miners treated equally
 
@@ -349,7 +378,7 @@ architecture handles sequential writes efficiently.
 | Compound vs individual? | **Compound** for any business with >= 10 txids/block; reduces callbacks and total bytes by orders of magnitude |
 | Minimum businesses? | **2 or more** sharing a Merkle Service benefits from subtree reuse; not sensitive to count |
 | Coinbase reseal cost? | **49–164 ms** at 1M-leaf subtrees (includes disk load + rebuild + save); small fraction of total |
-| Memory at scale? | **48 B/txid** with disk-backed subtrees (was 280 B/txid); 36 GB machine handles **391M txids** (was 63M) |
+| Memory at scale? | **80 B/txid** with disk-backed subtrees + GC headroom (was 280 B/txid); 36 GB machine handles **~210M txids** (was 63M); `GOMEMLIMIT` enforces budget |
 | Disk I/O cost? | **215 ms write, 16 ms read** per 1M-leaf subtree; 87–94% cache hit rate during BUMP assembly |
 | Competitive mining? | **All miners treated equally**; random winner; no optimization for a specific miner |
 | Parallel computation? | **2.6× merkle speedup**; embarrassingly parallel BUMP assembly and subtree sealing |
@@ -379,15 +408,17 @@ architecture handles sequential writes efficiently.
 5. **Coinbase reseal is not a concern.** Even at 1M-leaf subtrees it adds
    only ~50–164 ms to the critical path.
 
-6. **Memory: 48 B/txid + 1 GB overhead.** At 600M txids this is ~28 GB peak
-   during Phase 2 (txid list + TokenSubtreeIndex for all miners). During
-   Phase 4, only the winner's index (4 B/txid = 2.4 GB) plus a bounded
-   subtree cache is needed. The harness auto-detects system RAM at 55% budget.
+6. **Memory: 80 B/txid + 3 GB overhead.** At 600M txids this is ~48 GB peak
+   during Phase 2 (txid list + TokenSubtreeIndex for all miners + GC headroom).
+   During Phase 4, only the winner's index (10 B/txid) plus a bounded subtree
+   cache is needed. `debug.SetMemoryLimit` enforces the budget and
+   `debug.FreeOSMemory()` releases pages between phases. The harness
+   auto-detects system RAM at 55% budget.
 
 7. **Bounded LRU cache for BUMP assembly.** Each 1M-leaf subtree requires
-   ~100 MB in memory when loaded. The cache is sized to fill remaining memory
-   after accounting for the TokenSubtreeIndex. On a 36 GB machine with 2M
-   txids, all subtrees fit in cache (87–94% hit rate).
+   ~66 MB in memory when loaded. The cache budget conservatively accounts for
+   GC residual from Phase 2 (~2 GB), winner's TokenSubtreeIndex, BUMP worker
+   memory, and overhead.
 
 The subtree-based incremental approach **successfully moves the overwhelming
 majority of merkle computation out of the post-block critical window** at all

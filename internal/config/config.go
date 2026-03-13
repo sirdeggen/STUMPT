@@ -6,19 +6,31 @@ import (
 )
 
 // Phase 2 memory model (sealing):
+//
+// Persistent allocations:
 //   - In-memory txid list (ordered slice): 32B
-//   - TokenSubtreeIndex per miner: 4B × NumMiners
-//   - Temporary seal allocations amortized: ~4B
+//   - TokenSubtreeIndex per miner: ~10B (4B int32 + 6B slice growth + map bucket overhead)
+//
+// GC headroom:
+//   - Per-subtree temporaries (jitter copies, merkle stores, localIdx maps,
+//     byte serializations) total ~550MB per iteration. Go's GC with GOGC=100
+//     retains 1-2 iterations of garbage before collecting, adding ~18B/txid
+//     amortized over the block.
 //
 // bytesPerTxidBase is the per-txid cost excluding the miner-dependent part.
-const bytesPerTxidBase = 36 // 32B txid list + 4B temp
+const bytesPerTxidBase = 50 // 32B txid list + 18B GC headroom
 
-// bytesPerTxidPerMiner is the additional per-txid cost per miner (TokenSubtreeIndex).
-const bytesPerTxidPerMiner = 4
+// bytesPerTxidPerMiner is the additional per-txid cost per miner.
+// Includes the 4B int32 in TokenSubtreeIndex, plus ~6B for slice growth
+// (append doubles capacity) and inner map bucket overhead.
+const bytesPerTxidPerMiner = 10
 
 // overheadBytes is the estimated fixed overhead for BadgerDB, Go runtime/GC,
-// and other per-process costs. Subtrees are stored to disk, not in RAM.
-const overheadBytes = 1 << 30 // 1 GB
+// per-subtree temporary allocations, and BUMP assembly working memory.
+// At scale, BadgerDB alone uses ~500MB (memtables + caches + write buffers),
+// plus ~500MB Go runtime, plus ~1-2GB GC-retained temporaries from subtree
+// sealing, plus ~600MB BUMP worker memory (12 workers × 50MB).
+const overheadBytes = 3 << 30 // 3 GB
 
 // Config holds all configurable parameters for the STUMPT test harness.
 type Config struct {
@@ -56,6 +68,9 @@ type Config struct {
 func (c *Config) BytesPerTxid() int64 {
 	return bytesPerTxidBase + int64(c.NumMiners)*bytesPerTxidPerMiner
 }
+
+// OverheadBytes returns the fixed overhead constant (exported for main.go cache calc).
+func OverheadBytes() int64 { return overheadBytes }
 
 // Default returns a Config optimized for the current machine.
 // It auto-detects available memory and sets HashesPerBlock to use
@@ -208,8 +223,9 @@ func PrintSystemRequirements() {
 	}
 	fmt.Println("╚═══════════════╩═══════════════╩═══════════════╩══════════════════════════╝")
 	fmt.Println()
-	fmt.Printf("Memory model: %d B/txid (32B txid list + %d×4B tokenSubtreeIndex + 4B temp) + %.0f GB overhead\n",
-		bpt, numMiners, float64(overheadBytes)/(1<<30))
+	fmt.Printf("Memory model: %d B/txid (%dB base + %d×%dB per miner) + %.0f GB overhead\n",
+		bpt, bytesPerTxidBase, numMiners, bytesPerTxidPerMiner, float64(overheadBytes)/(1<<30))
+	fmt.Printf("Includes Go GC headroom, map/slice overhead, and per-subtree temporary allocations.\n")
 	fmt.Printf("Subtrees stored to disk via BadgerDB — not counted in per-txid memory.\n")
 	fmt.Println()
 }

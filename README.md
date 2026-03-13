@@ -35,28 +35,31 @@ The harness auto-detects your system's RAM and scales the default test to use ~5
 ╠═══════════════╦═══════════════╦═══════════════╦══════════════════════════╣
 ║   Total TXIDs ║   Subtrees    ║   Est. RAM    ║   Min System RAM        ║
 ╠═══════════════╬═══════════════╬═══════════════╬══════════════════════════╣
-║            2M ║       2 × 1M ║        1.1 GB ║        2.0 GB             ║
-║            4M ║       4 × 1M ║        1.2 GB ║        2.2 GB             ║
-║           10M ║      10 × 1M ║        1.5 GB ║        2.7 GB             ║
-║           21M ║      20 × 1M ║        1.9 GB ║        3.5 GB             ║
-║           42M ║      40 × 1M ║        2.9 GB ║        5.2 GB             ║
-║           63M ║      60 × 1M ║        3.8 GB ║        6.9 GB             ║
-║          105M ║     100 × 1M ║        5.7 GB ║       10.3 GB             ║
-║          157M ║     150 × 1M ║        8.0 GB ║       14.6 GB             ║
-║          315M ║     300 × 1M ║       15.1 GB ║       27.4 GB             ║
-║          629M ║     600 × 1M ║       29.1 GB ║       53.0 GB             ║
+║            2M ║       2 × 1M ║        3.2 GB ║        5.7 GB             ║
+║            4M ║       4 × 1M ║        3.3 GB ║        6.0 GB             ║
+║           10M ║      10 × 1M ║        3.8 GB ║        6.9 GB             ║
+║           21M ║      20 × 1M ║        4.6 GB ║        8.3 GB             ║
+║           42M ║      40 × 1M ║        6.1 GB ║       11.1 GB             ║
+║           63M ║      60 × 1M ║        7.7 GB ║       14.0 GB             ║
+║          105M ║     100 × 1M ║       10.8 GB ║       19.7 GB             ║
+║          157M ║     150 × 1M ║       14.7 GB ║       26.8 GB             ║
+║          315M ║     300 × 1M ║       26.4 GB ║       48.1 GB             ║
+║          629M ║     600 × 1M ║       49.9 GB ║       90.7 GB             ║
 ╚═══════════════╩═══════════════╩═══════════════╩══════════════════════════╝
 
-Memory model: 48 B/txid (32B txid list + 3×4B tokenSubtreeIndex + 4B temp) + 1 GB overhead
+Memory model: 80 B/txid (50B base + 3×10B per miner) + 3 GB overhead
+Includes Go GC headroom, map/slice overhead, and per-subtree temporary allocations.
 Subtrees stored to disk via BadgerDB — not counted in per-txid memory.
 ```
 
-**48 B/txid** breaks down as:
+**80 B/txid** (for 3 miners) breaks down as:
 - 32 B — in-memory txid list (ordered `[]chainhash.Hash` slice, freed after Phase 2)
-- 12 B — TokenSubtreeIndex entries for 3 miners (4 B × `int32` local position × 3 miners)
-- 4 B — temporary seal allocations (amortized)
+- 30 B — TokenSubtreeIndex for 3 miners (10 B each: 4 B `int32` data + 6 B slice growth / map bucket overhead)
+- 18 B — Go GC headroom (per-subtree temporaries: jitter copies, merkle stores, `localIdx` maps, byte serializations are ~550 MB per iteration; GC retains 1-2 iterations of garbage)
 
-**1 GB overhead** covers BadgerDB, Go runtime/GC, BUMP assembly buffers, and OS overhead.
+**3 GB overhead** covers BadgerDB memtables/caches (~500 MB), Go runtime/GC base (~500 MB), GC-retained temporary allocations (~1-2 GB), and BUMP assembly workers (~600 MB for 12 workers × 50 MB).
+
+The harness sets `debug.SetMemoryLimit` to the budget so Go's GC triggers more aggressively as the heap approaches the limit, and calls `debug.FreeOSMemory()` between phases to force the OS to reclaim freed pages.
 
 Subtree data (leaves + merkle stores) is stored to disk for all miners — not kept in RAM. During BUMP assembly, a bounded LRU cache loads subtrees on demand.
 
@@ -160,8 +163,8 @@ The defaults are auto-detected based on your system's available RAM:
 | Num businesses | 1 000 | distinct callback tokens |
 | Mock block height | 800 000 | stamped in every BUMP |
 
-For example, on a 36 GB machine the default is ~384 subtrees × 1M = **~403M txids** (~19.4 GB estimated).
-On a 16 GB machine: ~168 subtrees × 1M = **~176M txids**.
+For example, on a 36 GB machine the default is ~208 subtrees × 1M = **~218M txids** (~19.7 GB estimated).
+On a 16 GB machine: ~68 subtrees × 1M = **~71M txids**.
 
 ---
 

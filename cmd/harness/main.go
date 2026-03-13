@@ -31,6 +31,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"syscall"
 	"time"
@@ -41,9 +42,6 @@ import (
 	"github.com/bsv-blockchain/stumpt/internal/merkleservice"
 	"github.com/bsv-blockchain/stumpt/internal/metrics"
 )
-
-// overheadBytes mirrors config's overhead constant for cache size calculation.
-const overheadBytes = 1 << 30
 
 func main() {
 	cfg := config.Default()
@@ -108,6 +106,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Tell Go's GC to stay within our memory budget. This makes the GC
+	// trigger more aggressively as the heap approaches MaxMemoryBytes,
+	// preventing the RSS from blowing past our estimate.
+	debug.SetMemoryLimit(cfg.MaxMemoryBytes)
+
 	// Extend JitterPercent if NumMiners was changed via flag.
 	for len(cfg.JitterPercent) < cfg.NumMiners {
 		cfg.JitterPercent = append(cfg.JitterPercent, 0.10)
@@ -130,6 +133,7 @@ func main() {
 		"numBusinesses", cfg.NumBusinesses,
 		"estMemoryGB", fmt.Sprintf("%.1f", float64(cfg.EstimatedMemoryBytes())/(1<<30)),
 		"memBudgetGB", fmt.Sprintf("%.1f", float64(cfg.MaxMemoryBytes)/(1<<30)),
+		"memLimitGB", fmt.Sprintf("%.1f", float64(cfg.MaxMemoryBytes)/(1<<30)),
 	)
 
 	// Handle OS signals for clean shutdown.
@@ -153,6 +157,8 @@ func run(cfg *config.Config, mc *metrics.Collector) {
 		os.Exit(1)
 	}
 	defer db.Close()
+
+	overheadBytes := config.OverheadBytes()
 
 	// ════════════════════════════════════════════════════════════════════════
 	// PHASE 1 — Generate txids
@@ -222,6 +228,10 @@ func run(cfg *config.Config, mc *metrics.Collector) {
 	// Free the txid list — it's no longer needed.
 	txids = nil
 	runtime.GC()
+	// Force the OS to reclaim freed pages. Without this, macOS MADV_FREE
+	// keeps freed pages as RSS until under memory pressure, which causes
+	// Phase 4 cache allocations to stack on top of Phase 2's ghost RSS.
+	debug.FreeOSMemory()
 
 	// ════════════════════════════════════════════════════════════════════════
 	// PHASE 4 — Block found (critical path, timed)
@@ -244,14 +254,24 @@ func run(cfg *config.Config, mc *metrics.Collector) {
 	}
 	minerTokenIdx = nil
 	minerRoots = nil
+	runtime.GC()
+	debug.FreeOSMemory()
 
-	// Calculate subtree cache size: each 1M-leaf subtree is ~100MB in memory.
-	// Use remaining memory budget for the cache.
-	bytesPerCachedSubtree := int64(cfg.HashesPerSubtree) * 100 // ~100B per leaf (leaves + store)
-	tokenIdxMem := int64(cfg.HashesPerBlock) * 4               // winner's TokenSubtreeIndex
-	available := cfg.MaxMemoryBytes - overheadBytes - tokenIdxMem
-	if available < 0 {
-		available = bytesPerCachedSubtree // at least 1
+	// Calculate subtree cache size conservatively.
+	//
+	// Each cached subtree holds leaves + store in memory:
+	//   leaves: HashesPerSubtree × 32B
+	//   store:  ~HashesPerSubtree × 32B (NextPowerOfTwo(N)-1 nodes)
+	//   Total:  ~66B per leaf
+	//
+	// Available = budget - overhead - winner's TokenSubtreeIndex - GC residual - BUMP workers
+	bytesPerCachedSubtree := int64(cfg.HashesPerSubtree) * 66
+	tokenIdxMem := int64(cfg.HashesPerBlock) * 10             // winner's index with map overhead
+	gcResidual := int64(2 << 30)                              // GC may retain ~2GB of freed Phase 2 data
+	bumpWorkerMem := int64(runtime.GOMAXPROCS(0)) * 50 << 20  // ~50MB per BUMP worker
+	available := cfg.MaxMemoryBytes - overheadBytes - tokenIdxMem - gcResidual - bumpWorkerMem
+	if available < bytesPerCachedSubtree {
+		available = bytesPerCachedSubtree // at least 1 entry
 	}
 	maxCacheEntries := int(available / bytesPerCachedSubtree)
 	if maxCacheEntries < 1 {

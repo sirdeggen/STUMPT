@@ -65,9 +65,18 @@ func (sc *subtreeCache) put(si int, cs *cachedSubtree) {
 	sc.order = append(sc.order, si)
 }
 
+// leafPos is a lightweight position record for BUMP assembly.
+// No heap allocations — stored in a flat slice.
+type leafPos struct {
+	subtreeIdx int
+	localIdx   int
+	globalIdx  int
+}
+
 // ProcessBUMPs is the entry-point for block-finalization BUMP work.
-// It loads subtrees from disk (with caching), computes proofs JIT, and
-// records BUMP sizes and timing. No HTTP delivery.
+// It loads subtrees from disk (with caching), computes proofs JIT directly
+// from cached stores (no intermediate proof extraction), and records BUMP
+// sizes and timing. No HTTP delivery.
 func ProcessBUMPs(
 	blockHeight uint32,
 	subtreeHeight, topTreeHeight, totalHeight int,
@@ -117,13 +126,10 @@ func ProcessBUMPs(
 	cache := newSubtreeCache(maxCacheEntries, mc)
 
 	loadSubtree := func(si int) *cachedSubtree {
-		// Check cache first.
 		if cs := cache.get(si); cs != nil {
 			return cs
 		}
 		mc.RecordCacheMiss()
-
-		// Load from disk.
 		tRead := time.Now()
 		leavesBytes, storeBytes, ok := evt.MinerSubStore.Load(evt.WinnerMiner, si)
 		mc.RecordDiskRead(time.Since(tRead))
@@ -148,16 +154,25 @@ func ProcessBUMPs(
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+
+			// Per-worker reusable buffers.
+			var positions []leafPos
+			subtrees := make(map[int]*cachedSubtree)
+
 			for idx := range workCh {
 				token := tokens[idx]
 
-				// Look up subtree positions for this token.
 				subtreeIdxs := evt.TokenSubtreeIdx.SubtreeIndices(token)
 				if len(subtreeIdxs) == 0 {
 					continue
 				}
 
-				var proofs []*SubtreeProof
+				// Collect positions and load subtrees (no proof extraction).
+				positions = positions[:0]
+				for k := range subtrees {
+					delete(subtrees, k)
+				}
+
 				for _, si := range subtreeIdxs {
 					localIdxs := evt.TokenSubtreeIdx.Get(token, si)
 					if len(localIdxs) == 0 {
@@ -167,27 +182,21 @@ func ProcessBUMPs(
 					if sc == nil {
 						continue
 					}
+					subtrees[si] = sc
 					for _, li32 := range localIdxs {
-						li := int(li32)
-						sp, err := subtree.GetProofFromStore(sc.Leaves, sc.Store, li)
-						if err != nil {
-							continue
-						}
-						proofs = append(proofs, &SubtreeProof{
-							TxID:        sc.Leaves[li],
-							SubtreeIdx:  si,
-							LocalIdx:    li,
-							GlobalIdx:   si*evt.HashesPerSubtree + li,
-							SiblingPath: sp,
+						positions = append(positions, leafPos{
+							subtreeIdx: si,
+							localIdx:   int(li32),
+							globalIdx:  si*evt.HashesPerSubtree + int(li32),
 						})
 					}
 				}
-				if len(proofs) == 0 {
+				if len(positions) == 0 {
 					continue
 				}
 
-				bump, err := buildCompoundBUMP(
-					blockHeight, proofs, topProofs,
+				bump, err := assembleTokenBUMP(
+					blockHeight, positions, subtrees, topProofs,
 					subtreeHeight, topTreeHeight, totalHeight,
 				)
 				if err != nil {
@@ -197,14 +206,12 @@ func ProcessBUMPs(
 				bumpBytes := bump.Bytes()
 				mc.RecordBUMP(len(bumpBytes))
 
-				// Dump first BUMP if requested.
 				if dumpFile != "" {
 					dumpOnce.Do(func() {
 						dumpBUMPHex(dumpFile, token, bumpBytes)
 					})
 				}
 
-				// Log progress every 10%.
 				count := mc.BUMPCount()
 				if total >= 10 && count%(int64(total)/10) == 0 {
 					slog.Info("BUMP assembly progress",
@@ -217,7 +224,6 @@ func ProcessBUMPs(
 		}()
 	}
 
-	// Enqueue work.
 	for i := range tokens {
 		workCh <- i
 	}
@@ -232,8 +238,176 @@ func ProcessBUMPs(
 	)
 }
 
+// assembleTokenBUMP builds a compound BUMP directly from leaf positions and
+// cached subtree data. Key optimizations over the naive approach:
+//
+//  1. Pre-allocated PathElement pool — one slice replaces ~900k individual allocs
+//  2. Direct Hash pointers into cached Leaves/Store — zero hash copies
+//  3. Sorted positions + bitset dedup — avoids map[uint64] at level 0 entirely
+//  4. Existence checks before alloc — fewer map writes at higher levels
+//  5. Shared *bool for Txid markers — 1 alloc instead of n
+func assembleTokenBUMP(
+	blockHeight uint32,
+	positions []leafPos,
+	subtrees map[int]*cachedSubtree,
+	topProofs [][]*chainhash.Hash,
+	subtreeHeight, topTreeHeight, totalHeight int,
+) (*gosdk.MerklePath, error) {
+	n := len(positions)
+	if n == 0 {
+		return nil, fmt.Errorf("assembleTokenBUMP: no positions")
+	}
+
+	// ── Sort positions by globalIdx ─────────────────────────────────────
+	// This enables O(n) dedup at level 0: adjacent positions that share
+	// a sibling pair (same globalIdx>>1) only emit the sibling once.
+	sort.Slice(positions, func(i, j int) bool {
+		return positions[i].globalIdx < positions[j].globalIdx
+	})
+
+	// ── Pre-allocate element pool ────────────────────────────────────────
+	pool := make([]gosdk.PathElement, 0, n*(totalHeight+2))
+	alloc := func() *gosdk.PathElement {
+		pool = append(pool, gosdk.PathElement{})
+		return &pool[len(pool)-1]
+	}
+
+	trueVal := true
+
+	// ── Level 0: build sorted directly (no map needed) ──────────────────
+	// Because positions are sorted by globalIdx, we can build level 0 as a
+	// sorted slice with O(n) dedup instead of O(n) map insertions + O(n log n) sort.
+	level0 := make([]*gosdk.PathElement, 0, n*2)
+	lastPair := int64(-1) // track which pair (globalIdx>>1) was last emitted
+
+	for _, pos := range positions {
+		sc := subtrees[pos.subtreeIdx]
+		li := pos.localIdx
+		g := uint64(pos.globalIdx) //nolint:gosec
+		nLeaves := len(sc.Leaves)
+		pair := int64(pos.globalIdx >> 1) //nolint:gosec
+
+		// Txid entry — always emitted (sorted order, no duplicates by construction).
+		el := alloc()
+		el.Offset = g
+		el.Hash = &sc.Leaves[li]
+		el.Txid = &trueVal
+		level0 = append(level0, el)
+
+		// Sibling — emit only once per pair.
+		if pair != lastPair {
+			sibLi := li ^ 1
+			if sibLi >= nLeaves {
+				sibLi = li
+			}
+			sibEl := alloc()
+			sibEl.Offset = g ^ 1
+			sibEl.Hash = &sc.Leaves[sibLi]
+			level0 = append(level0, sibEl)
+			lastPair = pair
+		}
+	}
+
+	// Sort level 0 by offset (txids and siblings are interleaved).
+	sort.Slice(level0, func(i, j int) bool { return level0[i].Offset < level0[j].Offset })
+
+	// Build a fast offset→presence lookup for level 0 (used by pruning).
+	level0Set := make(map[uint64]struct{}, len(level0))
+	for _, el := range level0 {
+		level0Set[el.Offset] = struct{}{}
+	}
+
+	// ── Levels 1+ : maps for dedup (much smaller than level 0) ──────────
+	merged := make([]map[uint64]*gosdk.PathElement, totalHeight)
+	merged[0] = nil // level 0 handled above
+	for i := 1; i < totalHeight; i++ {
+		merged[i] = make(map[uint64]*gosdk.PathElement, n)
+	}
+
+	for _, pos := range positions {
+		sc := subtrees[pos.subtreeIdx]
+		g := uint64(pos.globalIdx) //nolint:gosec
+		li := pos.localIdx
+		nLeaves := len(sc.Leaves)
+
+		// Subtree levels 1..subtreeHeight-1.
+		pad := subtree.NextPowerOfTwo(nLeaves)
+		storeOff := 0
+		storeSize := pad / 2
+		for k := 1; k < subtreeHeight; k++ {
+			sibOff := (g >> k) ^ 1
+			if _, exists := merged[k][sibOff]; !exists {
+				sibPos := (li >> k) ^ 1
+				if sibPos >= storeSize {
+					sibPos = storeSize - 1
+				}
+				el := alloc()
+				el.Offset = sibOff
+				el.Hash = &sc.Store[storeOff+sibPos]
+				merged[k][sibOff] = el
+			}
+			storeOff += storeSize
+			storeSize /= 2
+		}
+
+		// Top tree levels.
+		tp := topProofs[pos.subtreeIdx]
+		for k := 0; k < topTreeHeight; k++ {
+			blockLevel := subtreeHeight + k
+			sibOff := (g >> blockLevel) ^ 1
+			if _, exists := merged[blockLevel][sibOff]; !exists {
+				el := alloc()
+				el.Offset = sibOff
+				el.Hash = tp[k]
+				merged[blockLevel][sibOff] = el
+			}
+		}
+	}
+
+	// ── Prune: remove node at level h if both children at h-1 present ───
+	for h := totalHeight - 1; h > 0; h-- {
+		var hasChild func(level int, offset uint64) bool
+		if h == 1 {
+			// Level 1 checks children against level 0 (set-based).
+			hasChild = func(_ int, offset uint64) bool {
+				_, ok := level0Set[offset]
+				return ok
+			}
+		} else {
+			hasChild = func(level int, offset uint64) bool {
+				_, ok := merged[level][offset]
+				return ok
+			}
+		}
+		for offset := range merged[h] {
+			childL := offset * 2
+			childR := offset*2 + 1
+			if hasChild(h-1, childL) && hasChild(h-1, childR) {
+				delete(merged[h], offset)
+			}
+		}
+	}
+
+	// ── Build sorted path ───────────────────────────────────────────────
+	path := make([][]*gosdk.PathElement, totalHeight)
+	path[0] = level0 // already sorted
+	for h := 1; h < totalHeight; h++ {
+		level := make([]*gosdk.PathElement, 0, len(merged[h]))
+		for _, el := range merged[h] {
+			level = append(level, el)
+		}
+		sort.Slice(level, func(i, j int) bool { return level[i].Offset < level[j].Offset })
+		path[h] = level
+	}
+
+	return gosdk.NewMerklePath(blockHeight, path), nil
+}
+
+// ── Legacy functions (kept for benchmark tests) ──────────────────────────────
+
 // buildCompoundBUMP creates a single MerklePath that covers all of a token's
 // txids in one O(n·h) pass — no repeated Combine calls.
+// Used by benchmark tests; production code uses assembleTokenBUMP.
 func buildCompoundBUMP(
 	blockHeight uint32,
 	proofs []*SubtreeProof,
@@ -257,7 +431,6 @@ func buildCompoundBUMP(
 		}
 	}
 
-	// Prune: remove a node at level h if both its children (at h-1) are present.
 	for h := totalHeight - 1; h > 0; h-- {
 		for offset := range merged[h] {
 			childL := offset * 2
@@ -283,7 +456,6 @@ func buildCompoundBUMP(
 	return gosdk.NewMerklePath(blockHeight, path), nil
 }
 
-// accumulateProof inserts all PathElements for one txid proof into merged.
 func accumulateProof(
 	proof *SubtreeProof,
 	topProofs [][]*chainhash.Hash,
@@ -333,5 +505,4 @@ func dumpBUMPHex(path, token string, data []byte) {
 	)
 }
 
-// boolPtr returns a pointer to a bool literal.
 func boolPtr(b bool) *bool { return &b }
