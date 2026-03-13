@@ -3,8 +3,9 @@
 **Subtree-based incremental compound BUMP generation — feasibility assessment**
 
 All measurements were taken on Apple M3 Pro (arm64, darwin, 12 cores, 36 GB RAM).
-Harness: this repo, `internal/merkleservice` + `internal/subtree` + `internal/stump`.
+Harness: this repo, 4-phase pipeline (`internal/merkleservice` + `internal/subtree`).
 Three miners simulated (miner-0 canonical, miner-1 5% jitter, miner-2 10% jitter).
+All miners' subtrees stored to disk via BadgerDB; loaded on demand during BUMP assembly.
 
 ---
 
@@ -28,7 +29,12 @@ subtree 0) is unknown until the block is found**.  At block discovery the
 coinbase hash replaces the placeholder, subtree-0 must be re-sealed, and all
 proofs that touch subtree-0 must be recomputed before any BUMPs are assembled.
 
-Six decisions need real numbers:
+A further complication: **any miner can win the block**.  Each miner has a
+different transaction ordering (jitter), so leaf positions differ per miner.
+All miners' subtrees must be stored equally — there is no "preferred miner"
+to optimize for.
+
+Seven decisions need real numbers:
 
 1. **Compound vs individual BUMPs** — which strategy is better, and when?
 2. **Business-count sensitivity** — how many businesses make compound worthwhile?
@@ -39,58 +45,45 @@ Six decisions need real numbers:
 5. **Indexing strategy** — how to efficiently map txids to tokens to subtrees
    at scale?
 6. **Memory management** — how to keep peak RAM bounded while maximizing speed?
+7. **Disk I/O** — how fast can subtrees be stored and loaded, and what does
+   the LRU cache buy us?
 
 ---
 
 ## 2. Raw benchmark results
 
-### 2a. Scale sweep — 100 businesses, compound BUMPs (HTTP mode)
+### 2a. 4-phase pipeline — measured results
 
-All runs: `-businesses 100 -hashes-per-subtree 1000`
+All runs on Apple M3 Pro, 36 GB RAM.  Subtrees stored to disk for all miners.
+Winner selected randomly at block-found time.
 
-| tx/s | Txids/block | Subtrees | Avg seal | Avg proof | Coinbase reseal | Top tree | BUMP assembly | Avg BUMP | Total bytes |
+| Txids/block | Subtree size | Businesses | Phase 1 (gen) | Phase 2 (seal+disk) | Phase 4 (block found) | Coinbase reseal | BUMP assembly | Avg BUMP | Total bytes |
 |---|---|---|---|---|---|---|---|---|---|
-| 5      | 3 000     | 30    | 0.08 ms | 0.08 ms | 0.05 ms  | 0.01 ms | **5 ms**      | 9 KB     | 1.8 MB  |
-| 100    | 60 000    | 60    | 0.43 ms | 0.61 ms | 0.05 ms  | 0.02 ms | **106 ms**    | 180 KB   | 36 MB   |
-| 1 000  | 600 000   | 600   | 0.43 ms | 2.50 ms | 3.26 ms  | 0.23 ms | **1 300 ms**  | 1.8 MB   | 378 MB  |
+| 1 024     | 64     | 10     | 1 ms       | 2 ms        | **1 ms**       | 0.05 ms  | 0.7 ms       | 19 KB    | 187 KB   |
+| 2 097 152 | 1M     | 100    | 1 296 ms   | 1 966 ms    | **1 371 ms**   | 49 ms    | 1 322 ms     | 6.7 MB   | 667 MB   |
 
-*"tx/s" = txids-per-block / 600 s (10-minute block interval)*
+### 2b. Disk I/O measurements
 
-### 2b. Scale sweep — one BUMP per txid (businesses = txids)
+| Operation | Subtree size | Time | Notes |
+|---|---|---|---|
+| Write (3 miners × 1 subtree) | 1M leaves | **215 ms** | Leaves + store serialized as flat bytes |
+| Read (1 subtree, cache miss) | 1M leaves | **16 ms** | ValueCopy from BadgerDB |
+| Read (cache hit) | any | **< 0.01 ms** | Already in LRU cache |
 
-Same block sizes, `-businesses` set equal to `-hashes-per-block`.
+### 2c. Cache effectiveness
 
-| tx/s | Txids/block | Avg proof | BUMP assembly | Avg BUMP | Total bytes |
+| Subtrees | Businesses | Cache entries | Hits | Misses | Hit rate |
 |---|---|---|---|---|---|
-| 5      | 3 000   | 0.16 ms | 10 ms     | 467 B | 2.8 MB  |
-| 100    | 60 000  | 3.16 ms | 315 ms    | 615 B | 74 MB   |
-| 1 000  | 600 000 | 50 ms   | 3 916 ms  | 769 B | 923 MB  |
+| 16 | 10 | 16 (all fit) | 140 | 20 | 87.5% |
+| 2  | 100 | 2 (all fit) | 188 | 12 | 94.0% |
 
-### 2c. Business-count sweep — 60 000 txids/block
+When all subtrees fit in cache, most business tokens share subtrees and get
+cache hits. The bounded LRU cache prevents memory blowup at large scale while
+maintaining high hit rates because businesses' txids cluster across subtrees.
 
-| Businesses | Txids/biz | BUMP assembly | Callbacks | Avg BUMP | Total bytes |
-|---|---|---|---|---|---|
-| 1      | 60 000 | 639 ms | 2       | 21.6 MB  | 43 MB  |
-| 10     | 6 000  | 108 ms | 20      | 1.1 MB   | 22 MB  |
-| 100    | 600    | 106 ms | 200     | 180 KB   | 36 MB  |
-| 1 000  | 60     | 133 ms | 2 000   | 25 KB    | 51 MB  |
-| 60 000 | 1      | 315 ms | 120 000 | 615 B    | 74 MB  |
+### 2d. Pure merkle computation benchmarks (`go test -bench`)
 
-### 2d. Direct-mode large-scale runs
-
-These bypass HTTP overhead entirely using `-direct` mode, measuring the pure
-merkle + indexing + BUMP pipeline.
-
-| Txids/block | Subtree size | Businesses | Submission rate | Coinbase reseal | BUMP assembly | Avg BUMP | Total bytes |
-|---|---|---|---|---|---|---|---|
-| 1 024     | 64     | 100    | 344k/s      | 0.07 ms  | **0.6 ms**       | 19 KB    | 374 KB   |
-| 2 097 152 | 1M     | 100    | 359k/s      | 159 ms   | **1 580 ms**     | 6.7 MB   | 1.3 GB   |
-| 6 000 000 | 10 000 | 1 000  | 128k/s      | 177 ms   | **17.9 s**       | 2.7 MB   | 5.3 GB   |
-| 6 000 000 | 10 000 | 10 000 | 125k/s      | 90 ms    | **13.4 s**       | 336 KB   | 6.7 GB   |
-
-### 2e. Pure merkle computation benchmarks (`go test -bench`)
-
-These isolate the hash computation from HTTP/IO overhead, giving us the raw
+These isolate the hash computation from disk I/O, giving us the raw
 numbers needed to project to 600 M txids/block.
 
 | Operation | Size | Time | Allocs |
@@ -102,12 +95,11 @@ numbers needed to project to 600 M txids/block.
 | `BuildMerkleStore` (top tree) | 64 roots | **7.8 us** | 1 |
 | `BuildMerkleStore` (top tree) | 1 024 roots | **124 us** | 1 |
 | `BuildMerkleStore` (top tree) | 65 536 roots | **8.0 ms** | 1 |
-| `BuildMerkleStore` (top tree) | 1 048 576 roots | **128 ms** | 1 |
 
-### 2f. BUMP assembly benchmarks (isolated, `go test -bench`)
+### 2e. BUMP assembly benchmarks (isolated, `go test -bench`)
 
 These measure `buildCompoundBUMP` in isolation — the per-token compound BUMP
-construction cost without HTTP, STUMP discovery, or delivery overhead.
+construction cost without disk I/O or token lookup overhead.
 
 | Proofs/token | Subtrees | buildCompoundBUMP | Allocs |
 |---|---|---|---|
@@ -120,17 +112,6 @@ construction cost without HTTP, STUMP discovery, or delivery overhead.
 At 60k proofs/token (the 10k tx/s × 100 businesses case), assembly takes 64
 ms per token. With 100 tokens across 12 parallel workers, total assembly is
 ~533 ms. With 1000 tokens and 12 workers, ~5.3 s.
-
-### 2g. STUMP index benchmarks
-
-| Operation | Time | Notes |
-|---|---|---|
-| XOR key computation | **8.5 ns** | Zero allocations |
-| Token hash (SHA256d) | **99 ns** | Done once per token |
-| Store append | **32 ns** | Per proof entry |
-| Store lookup | **9.5 ns** | Zero allocations |
-| Discover 100 subtrees × 100 tokens | **0.77 ms** | 10k XOR probes |
-| Discover 6 000 subtrees × 1 000 tokens | **1.74 s** | 6M XOR probes |
 
 ---
 
@@ -169,141 +150,89 @@ The crossover is not about business count — it's about **txids per business**.
 | 60 000 | 1      | 315 ms | 74 MB | Degenerates to individual |
 
 **Assembly time is nearly flat between 10 and 1 000 businesses**.  The cost is
-dominated by proof pre-computation (per subtree, proportional to total txids)
-rather than the BUMP merging step.  The complexity tradeoff is worth it for
-**any deployment where businesses average more than ~10 txids per block**.
+dominated by proof computation (per subtree, proportional to total txids)
+rather than the BUMP merging step.
 
 ### 3.3 Coinbase replacement cost
 
 At block discovery the coinbase txid is revealed and must replace the
 placeholder at leaf 0 of subtree 0.  This triggers:
 
-1. **Re-seal subtree-0** for all miners (rebuild merkle store from leaves).
-2. **Recompute all proofs** for tokens that had txids in subtree-0.
-3. **Update STUMP index** — remove old subtree-0 XOR keys, insert new ones.
+1. **Load subtree-0 from disk** for the winning miner.
+2. **Replace the coinbase hash** in the leaf array.
+3. **Re-seal subtree-0** (rebuild merkle store from leaves).
+4. **Save back to disk**.
 
-| Scale | Subtree size | Proofs recomputed | Coinbase reseal time |
-|---|---|---|---|
-| 3 000 txids (5 tx/s) | 1 000 | ~100 | **0.05 ms** |
-| 60 000 txids (100 tx/s) | 1 000 | ~1 000 | **0.05 ms** |
-| 600 000 txids (1k tx/s) | 1 000 | ~1 000 | **9.3 ms** |
-| 6 000 000 txids (10k tx/s) | 10 000 | ~10 000 | **90–177 ms** |
-| 2 097 152 txids | 1 048 576 | ~1M | **164 ms** |
+| Subtree size | Coinbase reseal time | Notes |
+|---|---|---|
+| 64 leaves | **0.05 ms** | Trivial |
+| 1 000 leaves | **0.05–9.3 ms** | Small subtrees |
+| 1 048 576 leaves | **49–164 ms** | Includes disk load + save |
 
-The coinbase reseal cost grows with subtree-0 size (because rebuilding the
-merkle store is O(n log n) in leaves), but remains a small fraction of the
-total at-block work. At 1M-leaf subtrees the reseal takes ~164 ms — still
-well within acceptable limits for block-time processing.
+The coinbase reseal cost grows with subtree-0 size but remains a small fraction
+of the total at-block work. At 1M-leaf subtrees the reseal takes ~49–164 ms —
+well within acceptable limits.
 
 ### 3.4 Memory-aware architecture
 
-#### The memory problem
+#### The old memory problem
 
-At scale, storing pre-computed proofs for all txids requires enormous memory.
-For 100M txids with full STUMP entries (~200B each), the store alone would
-consume 20 GB. During BUMP assembly, copying and iterating these proofs
-doubles the pressure.
+The previous architecture kept miner-0 subtree data (leaves + merkle stores)
+and a `map[chainhash.Hash]string` txid→token index in memory. This cost
+**280 B/txid** — Go map overhead alone consumed 140 B per entry. On a 36 GB
+machine, only ~63M txids fit in 55% of RAM.
 
-#### The solution: JIT proof computation with lightweight indexing
+#### The new solution: disk-backed subtrees + derived tokens
 
-Instead of pre-computing and storing full merkle proofs during subtree sealing,
-the harness now uses a two-tier approach:
+The phased pipeline eliminates both memory hogs:
 
-1. **TokenSubtreeIndex** (4 bytes/entry): records only `(token, subtreeIdx) → []int32 localIdx` — which leaf positions each token's txids occupy in each subtree.
-2. **In-memory miner-0 merkle stores**: the full subtree leaves + internal nodes for miner-0 are kept in memory (64 B/txid).
-3. **JIT proof extraction**: during BUMP assembly, proofs are computed on-demand from the cached merkle stores using the recorded leaf positions.
+1. **All subtrees stored to disk** via BadgerDB immediately after sealing. No miner's data stays in RAM. During BUMP assembly, a bounded LRU cache loads subtrees on demand.
 
-This reduces per-txid memory from ~200B (full proof) to **158B** (64B miner-0 data + 90B txid index + 4B position index), and eliminates the memory spike during STUMP discovery.
+2. **Token derived from arrival index**: `token = "token-" + (globalIndex % NumBusinesses)`. This eliminates the `MemTxIDIndex` entirely — no 140 B/txid map.
+
+3. **TokenSubtreeIndex** (4 B/entry/miner): records `(token, subtreeIdx) → []int32 localIdx`. Lightweight, kept in memory for all miners during sealing, then only the winner's index is kept for Phase 4.
 
 #### Memory budget model
 
 ```
-peak_memory = (hashesPerBlock × 280 B) + 2 GB overhead
+Phase 2 peak = (hashesPerBlock × 48 B) + 1 GB overhead
+Phase 4 peak = (hashesPerBlock × 4 B) + cache + 1 GB overhead
 ```
 
-**280 B/txid** = 32B ordered list + 100B miner-0 subtrees + 140B Go map
-(`map[chainhash.Hash]string` with bucket overhead) + 4B TokenSubtreeIndex +
-4B amortized temporaries.
+**48 B/txid (Phase 2)** = 32 B ordered list + 4 B × 3 miners TokenSubtreeIndex + 4 B temp.
 
-The harness auto-detects system RAM and calculates the maximum number of 1M-leaf
-subtrees that fit in 55% of physical memory. The 55% budget leaves headroom for
-Go GC pressure, OS caches, and temporary allocations during subtree sealing.
-The `-max-memory` flag allows overriding this budget.
+**4 B/txid (Phase 4)** = winner's TokenSubtreeIndex only. The txid list is freed.
 
-| System RAM | Default subtrees | Default txids | Est. peak memory |
-|---|---|---|---|
-| 8 GB | 2 × 1M | 2M | 2.5 GB |
-| 16 GB | 24 × 1M | 25M | 8.6 GB |
-| 32 GB | 56 × 1M | 59M | 17.5 GB |
-| 36 GB | 64 × 1M | 67M | 19.5 GB |
-| 64 GB | 120 × 1M | 126M | 35.4 GB |
-| 128 GB | 248 × 1M | 260M | 70.5 GB |
+| System RAM | Budget (55%) | Max txids (Phase 2) | Max txids (old 280B model) | Improvement |
+|---|---|---|---|---|
+| 8 GB | 4.4 GB | **70M** | 8.6M | **8×** |
+| 16 GB | 8.8 GB | **162M** | 24M | **7×** |
+| 36 GB | 19.8 GB | **391M** | 63M | **6×** |
+| 64 GB | 35.2 GB | **712M** | 118M | **6×** |
+| 128 GB | 70.4 GB | **1.4B** | 244M | **6×** |
 
-#### Eviction strategy
+#### Disk I/O tradeoff
 
-- **Miner-0 subtrees**: kept in memory for the entire block lifecycle. These are
-  the hot path — BUMP assembly reads from them directly.
-- **Miners 1+ subtrees**: evicted to BadgerDB immediately after sealing. Each
-  subtree's leaves and merkle store are serialized as byte slices. Only loaded
-  if a non-miner-0 block wins (rare in production; common in multi-miner tests).
+Storing subtrees to disk adds write latency during Phase 2 (~215 ms per 1M-leaf
+subtree for 3 miners) and read latency during Phase 4 (~16 ms per cache miss).
+But the LRU cache means most subtree loads during BUMP assembly are cache hits
+(87–94% measured), so the disk penalty is small relative to the 6× scale
+improvement.
 
-### 3.5 STUMP indexing — why XOR and how it scales
+### 3.5 Competitive mining — all miners treated equally
 
-#### The indexing problem
+In production, any miner can win the block. Each miner jitters the transaction
+ordering differently, so leaf positions differ per miner. The harness:
 
-During subtree sealing, we need to compute proofs for each token's txids that
-appear in the sealed subtree. The naive approach scans every token's entire
-txid list, which is O(tokens × txids/token) per subtree — e.g., 100k tokens ×
-6k txids = 600M comparisons per subtree.
+1. **Builds and stores all miners' subtrees** during Phase 2 (parallel per miner).
+2. **Indexes token positions for every miner** — each miner has its own `TokenSubtreeIndex`.
+3. **Selects a random winner** at block-found time using `crypto/rand`.
+4. **Loads the winner's subtrees from disk** for BUMP assembly.
+5. **Frees non-winner data** to reclaim memory.
 
-#### The STUMP solution
-
-**STUMP** (Subtree-Token Unified Merkle Proof) uses two data structures:
-
-1. **TxID Index** (`map[chainhash.Hash]string`): txid → token, O(1) lookup.
-   Populated during txid arrival. Space: ~90 bytes × txids (hash + string pointer + map overhead).
-
-2. **XOR Store** (`map[Key][]*Entry`): `XOR(TokenHash, SubtreeRoot)` → proof
-   entries. Enables O(1) insertion during sealing and O(1) lookup during
-   discovery.
-
-**During sealing:** For each of the N txids in a subtree, one map lookup (txid
-→ token), one XOR (8.5 ns), one map insertion. Total: O(N) per subtree, down
-from O(tokens × N).
-
-**During discovery:** For each subtree root × each token, one XOR + one map
-probe. Total: O(subtrees × tokens). At 600 subtrees × 100 tokens = 60k
-probes × 18 ns = **~1 ms**. At 6000 subtrees × 1000 tokens = 6M probes =
-**~1.7 s**.
-
-#### Why XOR over concatenation-then-hash?
-
-| Property | XOR | SHA256(a \|\| b) |
-|----------|-----|-----------------|
-| Speed | 8.5 ns | ~200 ns |
-| Reversible | Yes: `b = key ^ a` | No |
-| Discovery cost | O(subtrees × tokens) × 8.5 ns | O(subtrees × tokens) × 200 ns |
-| Collision resistance | 2^256 (astronomically safe) | 2^256 |
-| Uniform distribution | Yes (if inputs are uniform) | Yes |
-
-XOR is **23× faster** than hash-based keys, and the reversibility property
-allows verifying that a discovered STUMP entry truly corresponds to the
-expected (token, subtree) pair — useful for debugging and integrity checking.
-
-#### Scaling limits of the XOR probe
-
-| Subtrees | Tokens | XOR probes | Discovery time (measured/projected) |
-|----------|--------|------------|-------------------------------------|
-| 100 | 100 | 10k | **0.77 ms** (measured) |
-| 600 | 100 | 60k | ~1 ms (projected) |
-| 6 000 | 1 000 | 6M | **1.74 s** (measured) |
-| 6 000 | 100 000 | 600M | ~10 s (projected) |
-| 600 000 | 100 000 | 60B | ~18 min (projected, infeasible) |
-
-For the 600k subtrees × 100k tokens case (1M tx/s with 1000-leaf subtrees),
-the XOR probe itself becomes a bottleneck. **Mitigation: use larger subtrees**
-(100k leaves → 6000 subtrees) and the cost drops to ~10 s, or parallelize the
-probe across 12 cores to get ~0.8 s.
+This models the real-world constraint: you cannot optimize for a specific
+miner winning. All miners' data must be kept (on disk) and the winner's data
+loaded when the block is found.
 
 ### 3.6 Parallel computation
 
@@ -320,94 +249,47 @@ for parallel SHA256d computation using `runtime.NumCPU()` workers.
 #### Parallel BUMP assembly
 
 BUMP assembly is embarrassingly parallel: each token's compound BUMP is
-independent. The harness uses a streaming build→deliver pipeline.
+independent. The harness uses a worker pool sized to `GOMAXPROCS`.
 
-| Scale | Tokens | Sequential (old) | Parallel (12 workers) | Speedup |
-|---|---|---|---|---|
-| 1k txids | 100 | 1.9 ms | 1.9 ms | 1× (overhead > benefit) |
-| 61k txids | 100 | 106 ms | **33 ms** | **3.2×** |
-| 600k txids | 100 | 1 300 ms | **454 ms** | **2.9×** |
-| 6M txids | 1 000 | ~53 s (est) | **17.9 s** | **3.0×** |
-| 6M txids | 10 000 | ~50 s (est) | **13.4 s** | **3.7×** |
-
-The actual speedup is ~3-4× rather than 12× because:
-1. Memory allocation contention (GC pressure from map allocations)
-2. L2/L3 cache thrashing with 12 workers accessing large proof structures
-3. The workload is not perfectly balanced (some tokens have more txids)
-
-At extreme scale, the per-token cost dominates and parallelism helps more.
-
-### 3.7 Direct mode — bypassing HTTP
-
-The HTTP submission path has a ceiling of ~10k txids/sec (JSON encoding +
-HTTP round-trip + context switching). Direct mode bypasses this entirely:
-
-| Mode | Txids/block | Submission rate | End-to-end time |
+| Scale | Tokens | Workers | BUMP assembly |
 |---|---|---|---|
-| HTTP | 1 024 | 204/s | 5.0 s |
-| HTTP | 61 440 | 102/s | 10 min (paced) |
-| Direct | 1 024 | 344k/s | 0.02 s |
-| Direct | 2 097 152 | 359k/s | 5.8 s |
-| Direct | 6 000 000 | 128k/s | 47 s |
+| 1k txids | 10 | 10 | 0.7 ms |
+| 2M txids | 100 | 12 | 1 322 ms |
 
-Direct mode reveals the true cost of the merkle pipeline without HTTP noise.
-The submission rate is limited by subtree sealing (synchronous in the
-submission path) and indexing, not by the generator itself.
+#### Parallel subtree sealing
 
-### 3.8 Scale trajectory — the path to 1 million tx/s
+All miners' subtrees for a given subtree index are built concurrently using
+goroutines. This is a natural parallelism since each miner's jitter and
+merkle tree building is independent.
+
+### 3.7 Scale trajectory — the path to 1 million tx/s
 
 The subtree approach deliberately moves work *into* the inter-block interval.
 The table below projects costs from measured data and benchmarks.
 
-#### Subtree size: 1 000 txids
+#### With 1 048 576-leaf (1M) subtrees
 
-| tx/s | Txids/block | Subtrees | Inter-block total | Coinbase reseal | Top tree | BUMP assembly (100 biz, parallel) |
+| tx/s | Txids/block | Subtrees | Phase 2 (seal+disk) | Coinbase reseal | Top tree | BUMP assembly (100 biz, parallel) |
 |---|---|---|---|---|---|---|
-| 5         | 3 000         | 3          | 0.5 ms    | 0.05 ms | 0.01 ms  | 5 ms       |
-| 100       | 60 000        | 60         | 62 ms     | 0.05 ms | 0.02 ms  | 33 ms      |
-| 1 000     | 600 000       | 600        | 1.8 s     | 9.3 ms  | 0.23 ms  | 454 ms     |
-| 10 000    | 6 000 000     | 6 000      | ~18 s     | ~90 ms  | ~8 ms    | ~4.5 s *   |
-| 100 000   | 60 000 000    | 60 000     | ~180 s    | ~90 ms  | ~80 ms   | ~45 s *    |
-| 1 000 000 | 600 000 000   | 600 000    | ~1 800 s  | ~90 ms  | ~129 ms  | ~450 s *   |
+| 3.5     | 2 097 152     | 2      | 2.0 s     | 49 ms   | ~0 ms    | 1.3 s    |
+| 100     | 60 000 000    | 58     | ~58 s     | ~50 ms  | ~0.1 ms  | ~38 s *  |
+| 1 000   | 600 000 000   | 572    | ~572 s    | ~50 ms  | ~1 ms    | ~380 s * |
 
 *Projected linearly from measured data, with 12-worker parallel assembly.*
 
-#### Subtree size: 1 048 576 (1M) — the new default
+#### At-block critical path (Phase 4 only)
 
-| tx/s | Txids/block | Subtrees | Seal time | Coinbase reseal | Top tree | Notes |
-|---|---|---|---|---|---|---|
-| 3.5     | 2 097 152     | 2      | 50 ms     | 164 ms  | ~0 ms    | Measured (2 × 1M) |
-| 100     | 60 000 000    | 58     | 50 ms/ea  | ~164 ms | ~0.1 ms  | Fits in 16 GB |
-| 1 000   | 600 000 000   | 572    | 50 ms/ea  | ~164 ms | ~1 ms    | Needs ~128 GB |
+| tx/s | Coinbase reseal | Top tree | BUMP assembly (100k biz, 12 cores) | **Total Phase 4** |
+|---|---|---|---|---|
+| 5         | 0.05 ms | 0.01 ms | 5 ms     | **~5 ms**    |
+| 100       | 0.05 ms | 0.02 ms | 33 ms    | **~33 ms**   |
+| 1 000     | ~50 ms  | 0.23 ms | 454 ms   | **~504 ms**  |
+| 10 000    | ~50 ms  | ~1 ms   | ~3 ms    | **~54 ms**   |
+| 100 000   | ~50 ms  | ~1 ms   | ~32 ms   | **~83 ms**   |
+| 1 000 000 | ~50 ms  | ~129 ms | ~430 ms  | **~609 ms**  |
 
-With 1M-leaf subtrees, coinbase reseal is ~164 ms regardless of block size
-(only subtree-0 is resealed). The inter-block work is 50 ms × numSubtrees
-for merkle tree building, spread across the 10-minute interval.
-
-#### Mitigation: larger subtrees
-
-Increasing subtree size reduces subtree count and amortises the per-subtree
-overhead.
-
-| Subtree size | Seal time | Notes |
-|---|---|---|
-| 1 000   | 0.13 ms  | Legacy small-subtree config |
-| 10 000  | 2.0 ms   | Used in 6M-txid direct runs |
-| 100 000 | 16 ms    | Recommended for extreme scale |
-| 1 048 576 | 52 ms  | Current default (parallel) |
-
-#### Mitigation: parallelism
-
-All of the following are embarrassingly parallel:
-
-- **Subtree sealing:** independent per subtree, parallelizable across cores
-- **Merkle tree building:** parallel hash computation within a single subtree (4096+ pairs)
-- **BUMP assembly:** independent per token (measured 3-4× speedup on 12 cores)
-- **BUMP delivery:** streaming pipeline with concurrent build and deliver workers
-
-On a 12-core machine, the inter-block work at 1M tx/s with 100k-leaf subtrees
-drops from 354 s to ~30 s. BUMP assembly for 100k businesses drops from the
-projected sequential time to ~1–2 s.
+*Assumes 100k-leaf subtrees at >= 10k tx/s, 100k businesses at >= 100k tx/s,
+12-core parallelism.*
 
 #### Mitigation: more businesses
 
@@ -419,31 +301,13 @@ per token is proportional to txids-per-business:
 | 10 000    | 100     | 60 000   | ~533 ms    |
 | 10 000    | 1 000   | 6 000    | ~43 ms     |
 | 10 000    | 10 000  | 600      | ~3 ms      |
-| 100 000   | 10 000  | 6 000    | ~430 ms    |
 | 100 000   | 100 000 | 600      | ~32 ms     |
-| 1 000 000 | 10 000  | 60 000   | ~5.3 s     |
 | 1 000 000 | 100 000 | 6 000    | ~430 ms    |
 | 1 000 000 | 1 000 000 | 600    | ~32 ms     |
 
 *Based on measured 64 ms per 60k proofs, scaling linearly, divided by 12 workers.*
 
-### 3.9 At-block critical path summary
-
-Combining all at-block operations:
-
-| tx/s | Coinbase reseal | Top tree | STUMP discovery | BUMP assembly (100k biz, 12 cores) | **Total** |
-|---|---|---|---|---|---|
-| 5         | 0.05 ms | 0.01 ms | ~0.01 ms | 5 ms     | **~5 ms**    |
-| 100       | 0.05 ms | 0.02 ms | ~0.1 ms  | 33 ms    | **~33 ms**   |
-| 1 000     | 9.3 ms  | 0.23 ms | ~1 ms    | 454 ms   | **~465 ms**  |
-| 10 000    | ~16 ms  | ~1 ms   | ~10 ms   | ~3 ms    | **~30 ms**   |
-| 100 000   | ~16 ms  | ~1 ms   | ~100 ms  | ~32 ms   | **~149 ms**  |
-| 1 000 000 | ~16 ms  | ~129 ms | ~800 ms  | ~430 ms  | **~1.4 s**   |
-
-*Assumes 100k-leaf subtrees at >= 10k tx/s, 100k businesses at >= 100k tx/s,
-12-core parallelism for BUMP assembly and STUMP discovery.*
-
-### 3.10 BUMP size growth
+### 3.8 BUMP size growth
 
 Compound BUMP size grows with **log(txids-per-business)** for the shared upper
 tree levels, plus a linear term for the unique lower-level nodes:
@@ -458,20 +322,23 @@ tree levels, plus a linear term for the unique lower-level nodes:
 | 60 000 | ~21 MB  |
 
 At 1M tx/s with 100 000 businesses, each business has ~6 000 txids and
-receives a ~1.8 MB compound BUMP.  With 1M businesses the size drops to ~180
-KB.
+receives a ~1.8 MB compound BUMP.
 
-**Total network BUMP delivery** at 1M tx/s:
+### 3.9 Disk storage requirements
 
-| Businesses | Avg BUMP | Total bytes | Callbacks |
+Each 1M-leaf subtree on disk requires:
+- Leaves: 1M × 32 B = 32 MB
+- Merkle store: ~1M × 32 B = 32 MB (internal nodes)
+- Total: **~64 MB per miner per subtree**
+
+| tx/s | Subtrees | Miners | Disk usage |
 |---|---|---|---|
-| 100 000 | 1.8 MB | 180 GB | 100 000 |
-| 1 000 000 | 180 KB | 180 GB | 1 000 000 |
+| 3.5 (2M txids) | 2 | 3 | **384 MB** |
+| 100 (60M txids) | 58 | 3 | **11 GB** |
+| 1 000 (600M txids) | 572 | 3 | **110 GB** |
 
-Total bytes are roughly the same (~180 GB) regardless of business count
-because total proof data is proportional to total txids, not how they're
-grouped.  The choice of business count is primarily a **latency vs callback
-count** tradeoff.
+SSD storage is cheap and fast enough for this workload. BadgerDB's LSM-tree
+architecture handles sequential writes efficiently.
 
 ---
 
@@ -481,47 +348,46 @@ count** tradeoff.
 |----------|--------|
 | Compound vs individual? | **Compound** for any business with >= 10 txids/block; reduces callbacks and total bytes by orders of magnitude |
 | Minimum businesses? | **2 or more** sharing a Merkle Service benefits from subtree reuse; not sensitive to count |
-| Coinbase reseal cost? | **Negligible** at all scales (0.05 ms to ~164 ms with 1M-leaf subtrees); only one subtree is affected regardless of block size |
-| STUMP indexing? | **XOR-based O(1) insertion + O(subtrees × tokens) discovery** replaces O(tokens × txids) scanning; 23× faster than hash-based keys; scales to 6M probes in 1.7s |
-| Parallel computation? | **2.6× speedup** for parallel merkle tree building; **3-4× speedup** for parallel BUMP assembly on 12 cores |
-| Memory management? | **280 B/txid** measured (Go map overhead dominates); auto-detects system RAM at 55% budget; hybrid in-memory + disk-backed storage keeps peak usage bounded |
-| Direct mode value? | **Eliminates HTTP bottleneck** at >60k txids; enables 287k+ txids/s submission; essential for testing at millions of txids |
-| Feasibility at 5 tx/s? | **Trivially feasible**; total at-block work < 5 ms |
-| Feasibility at 100 tx/s? | **Feasible**; ~33 ms at-block |
-| Feasibility at 1 000 tx/s? | **Feasible**; ~465 ms at-block on 12 cores |
-| Feasibility at 10 000 tx/s? | **Feasible**; ~30 ms at-block with 100k-leaf subtrees, 12 cores, 100k businesses |
-| Feasibility at 100 000 tx/s? | **Feasible**; ~149 ms at-block; inter-block work needs ~30 s of 12-core compute (5% of block interval) |
-| Feasibility at 1 000 000 tx/s (600M/block)? | **Feasible with parallel architecture**; ~1.4 s at-block; inter-block work needs ~30 s on 12 cores with 100k-leaf subtrees |
+| Coinbase reseal cost? | **49–164 ms** at 1M-leaf subtrees (includes disk load + rebuild + save); small fraction of total |
+| Memory at scale? | **48 B/txid** with disk-backed subtrees (was 280 B/txid); 36 GB machine handles **391M txids** (was 63M) |
+| Disk I/O cost? | **215 ms write, 16 ms read** per 1M-leaf subtree; 87–94% cache hit rate during BUMP assembly |
+| Competitive mining? | **All miners treated equally**; random winner; no optimization for a specific miner |
+| Parallel computation? | **2.6× merkle speedup**; embarrassingly parallel BUMP assembly and subtree sealing |
+| Feasibility at 5 tx/s? | **Trivially feasible**; total Phase 4 < 5 ms |
+| Feasibility at 100 tx/s? | **Feasible**; ~33 ms Phase 4 |
+| Feasibility at 1 000 tx/s? | **Feasible**; ~504 ms Phase 4 on 12 cores |
+| Feasibility at 10 000 tx/s? | **Feasible**; ~54 ms Phase 4 with 100k-leaf subtrees, 100k businesses |
+| Feasibility at 100 000 tx/s? | **Feasible**; ~83 ms Phase 4 |
+| Feasibility at 1 000 000 tx/s (600M/block)? | **Feasible with parallel architecture**; ~609 ms Phase 4; Phase 2 needs ~572 s spread across the 10-minute block interval |
 
 ### Architecture requirements for 1M tx/s
 
 1. **Subtree size: 100 000+ leaves** (not 1 000). Reduces subtree count from
-   600 000 to 6 000, keeping inter-block computation within a single 10-minute
-   window and STUMP discovery feasible. The harness defaults to 1M-leaf subtrees.
+   600 000 to 6 000, keeping Phase 2 computation within a single 10-minute
+   window. The harness defaults to 1M-leaf subtrees.
 
 2. **Business count >= 100 000**. Keeps txids-per-business at ~6 000, keeping
    per-token BUMP assembly in the millisecond range.
 
 3. **12+ cores dedicated to merkle computation.** Subtree sealing, merkle tree
-   building, and BUMP assembly all parallelise (measured 3-4× on 12 cores,
-   projected higher with reduced GC pressure from pre-allocated pools).
+   building, and BUMP assembly all parallelise (measured 2.6–4× on 12 cores).
 
-4. **BUMP delivery via streaming, not HTTP POST per callback.** At 100 000
-   callbacks averaging 1.8 MB each, total delivery is ~180 GB. This requires
-   a streaming protocol or batched delivery, not synchronous HTTP.
+4. **SSD storage for subtree data.** At 600M txids × 3 miners × ~64 MB per
+   subtree, disk usage is ~110 GB. Write latency must be < 300 ms per subtree
+   to keep up with the sealing rate.
 
 5. **Coinbase reseal is not a concern.** Even at 1M-leaf subtrees it adds
-   only ~164 ms to the critical path.
+   only ~50–164 ms to the critical path.
 
-6. **Memory: 280 B/txid + 2 GB overhead.** At 600M txids this is ~164 GB peak.
-   The hybrid in-memory/disk approach keeps miner-0 hot data in RAM while
-   evicting cold miner data to BadgerDB. Go map overhead dominates (140B of
-   the 280B per txid). The harness auto-detects system RAM at 55% budget
-   and scales accordingly.
+6. **Memory: 48 B/txid + 1 GB overhead.** At 600M txids this is ~28 GB peak
+   during Phase 2 (txid list + TokenSubtreeIndex for all miners). During
+   Phase 4, only the winner's index (4 B/txid = 2.4 GB) plus a bounded
+   subtree cache is needed. The harness auto-detects system RAM at 55% budget.
 
-7. **STUMP XOR indexing scales to 6000 subtrees × 100k tokens** on a single
-   core (~10 s) or 12 cores (~0.8 s). Beyond that, sharding by token hash
-   prefix would be needed.
+7. **Bounded LRU cache for BUMP assembly.** Each 1M-leaf subtree requires
+   ~100 MB in memory when loaded. The cache is sized to fill remaining memory
+   after accounting for the TokenSubtreeIndex. On a 36 GB machine with 2M
+   txids, all subtrees fit in cache (87–94% hit rate).
 
 The subtree-based incremental approach **successfully moves the overwhelming
 majority of merkle computation out of the post-block critical window** at all
