@@ -29,7 +29,7 @@ func Listen(addr string, maxTries int) (net.Listener, string, error) {
 				// Inform caller that the address shifted.
 				_ = i // used below in log; callers see resolved addr
 			}
-			return ln, ln.Addr().String(), nil
+			return ln, candidate, nil
 		}
 	}
 
