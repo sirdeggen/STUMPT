@@ -8,9 +8,15 @@ package subtree
 import (
 	"crypto/sha256"
 	"fmt"
+	"runtime"
+	"sync"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 )
+
+// parallelThreshold is the minimum number of pairs at a level to justify
+// spawning goroutines. Below this, serial is faster due to goroutine overhead.
+const parallelThreshold = 4096
 
 // ── hashing ──────────────────────────────────────────────────────────────────
 
@@ -78,12 +84,18 @@ func BuildMerkleStore(leaves []chainhash.Hash) []chainhash.Hash {
 
 	pad := NextPowerOfTwo(n)
 	store := make([]chainhash.Hash, pad-1)
+	numCPU := runtime.NumCPU()
 
 	// Level 1: hash adjacent pairs of leaves.
-	for i := 0; i < pad; i += 2 {
-		l := padLeaf(leaves, i, n)
-		r := padLeaf(leaves, i+1, n)
-		store[i/2] = HashPair(l, r)
+	numPairs := pad / 2
+	if numPairs >= parallelThreshold && numCPU > 1 {
+		parallelHashLeafPairs(leaves, store, n, pad, numCPU)
+	} else {
+		for i := 0; i < pad; i += 2 {
+			l := padLeaf(leaves, i, n)
+			r := padLeaf(leaves, i+1, n)
+			store[i/2] = HashPair(l, r)
+		}
 	}
 
 	// Build each subsequent level from the previous one.
@@ -91,14 +103,72 @@ func BuildMerkleStore(leaves []chainhash.Hash) []chainhash.Hash {
 	size := pad / 2 // number of nodes at the current level
 	for size > 1 {
 		nextSize := size / 2
-		for i := 0; i < size; i += 2 {
-			store[offset+size+i/2] = HashPair(store[offset+i], store[offset+i+1])
+		if size/2 >= parallelThreshold && numCPU > 1 {
+			parallelHashLevel(store, offset, size, numCPU)
+		} else {
+			for i := 0; i < size; i += 2 {
+				store[offset+size+i/2] = HashPair(store[offset+i], store[offset+i+1])
+			}
 		}
 		offset += size
 		size = nextSize
 	}
 
 	return store
+}
+
+// parallelHashLeafPairs hashes leaf pairs across multiple goroutines.
+func parallelHashLeafPairs(leaves, store []chainhash.Hash, n, pad, numWorkers int) {
+	numPairs := pad / 2
+	chunk := (numPairs + numWorkers - 1) / numWorkers
+	var wg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		lo := w * chunk
+		hi := lo + chunk
+		if hi > numPairs {
+			hi = numPairs
+		}
+		if lo >= hi {
+			break
+		}
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			for j := lo; j < hi; j++ {
+				i := j * 2
+				l := padLeaf(leaves, i, n)
+				r := padLeaf(leaves, i+1, n)
+				store[j] = HashPair(l, r)
+			}
+		}(lo, hi)
+	}
+	wg.Wait()
+}
+
+// parallelHashLevel hashes pairs within a single store level across goroutines.
+func parallelHashLevel(store []chainhash.Hash, offset, size, numWorkers int) {
+	numPairs := size / 2
+	chunk := (numPairs + numWorkers - 1) / numWorkers
+	var wg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		lo := w * chunk
+		hi := lo + chunk
+		if hi > numPairs {
+			hi = numPairs
+		}
+		if lo >= hi {
+			break
+		}
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			for j := lo; j < hi; j++ {
+				i := j * 2
+				store[offset+size+j] = HashPair(store[offset+i], store[offset+i+1])
+			}
+		}(lo, hi)
+	}
+	wg.Wait()
 }
 
 // MerkleRoot returns the merkle root of the given leaves.

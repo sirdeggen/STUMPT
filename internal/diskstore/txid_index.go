@@ -60,6 +60,26 @@ func (d *DiskTxIDIndex) Get(txid chainhash.Hash) (string, bool) {
 	return token, true
 }
 
+// BatchGet looks up multiple txids in a single BadgerDB View transaction.
+func (d *DiskTxIDIndex) BatchGet(txids []chainhash.Hash) []string {
+	result := make([]string, len(txids))
+	_ = d.db.BadgerDB().View(func(txn *badger.Txn) error {
+		for i, txid := range txids {
+			key := txidKey(txid)
+			item, err := txn.Get(key)
+			if err != nil {
+				continue
+			}
+			_ = item.Value(func(val []byte) error {
+				result[i] = string(val)
+				return nil
+			})
+		}
+		return nil
+	})
+	return result
+}
+
 // TxIDTokenPair holds a txid→token pair for batch writes.
 type TxIDTokenPair struct {
 	TxID  chainhash.Hash
@@ -137,6 +157,37 @@ func (b *BufferedTxIDIndex) Get(txid chainhash.Hash) (string, bool) {
 	}
 	b.mu.Unlock()
 	return b.inner.Get(txid)
+}
+
+// BatchGet checks the buffer for each txid first, then batch-reads remaining from disk.
+func (b *BufferedTxIDIndex) BatchGet(txids []chainhash.Hash) []string {
+	result := make([]string, len(txids))
+
+	// Check buffer first.
+	b.mu.Lock()
+	bufMap := make(map[chainhash.Hash]string, len(b.buf))
+	for _, p := range b.buf {
+		bufMap[p.TxID] = p.Token
+	}
+	b.mu.Unlock()
+
+	var diskIdxs []int
+	var diskTxids []chainhash.Hash
+	for i, txid := range txids {
+		if tok, ok := bufMap[txid]; ok {
+			result[i] = tok
+		} else {
+			diskIdxs = append(diskIdxs, i)
+			diskTxids = append(diskTxids, txid)
+		}
+	}
+	if len(diskTxids) > 0 {
+		diskResults := b.inner.BatchGet(diskTxids)
+		for j, idx := range diskIdxs {
+			result[idx] = diskResults[j]
+		}
+	}
+	return result
 }
 
 // Len returns the number of indexed txids on disk.

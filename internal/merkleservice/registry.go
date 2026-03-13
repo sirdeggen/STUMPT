@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	mathrand "math/rand"
+	"runtime"
 	"sync"
 	"time"
 
@@ -55,7 +56,7 @@ func newRegistry(cfg *config.Config, mc *metrics.Collector, db *diskstore.DB) *R
 		tokenCallback: make(map[string]CallbackInfo),
 		minerSubtrees: make([][]*MinerSubtree, cfg.NumMiners),
 		stumpStore:    diskstore.NewDiskStumpStore(db),
-		txidIndex:     diskstore.NewBufferedTxIDIndex(db, 1000),
+		txidIndex:     stump.NewMemTxIDIndex(),
 		tokenReg:      stump.NewTokenRegistry(),
 		blockCh:       make(chan *BlockFinalizedEvent, 1),
 		minerSubStore: diskstore.NewMinerSubtreeStore(db),
@@ -159,18 +160,25 @@ func (r *Registry) sealSubtree(subtreeIdx int, baseTxids []chainhash.Hash) {
 	cfg := r.cfg
 	t0 := time.Now()
 
+	// ── Parallel miner tree building ─────────────────────────────────────────
 	minerSubs := make([]*MinerSubtree, cfg.NumMiners)
+	var wg sync.WaitGroup
+	wg.Add(cfg.NumMiners)
 	for m := 0; m < cfg.NumMiners; m++ {
-		leaves := jitterTxids(baseTxids, m, subtreeIdx, cfg.JitterPercent)
-		store := subtree.BuildMerkleStore(leaves)
-		root := store[len(store)-1]
-		minerSubs[m] = &MinerSubtree{
-			Index:  subtreeIdx,
-			Leaves: leaves,
-			Root:   root,
-			Store:  store,
-		}
+		go func(m int) {
+			defer wg.Done()
+			leaves := jitterTxids(baseTxids, m, subtreeIdx, cfg.JitterPercent)
+			store := subtree.BuildMerkleStore(leaves)
+			root := store[len(store)-1]
+			minerSubs[m] = &MinerSubtree{
+				Index:  subtreeIdx,
+				Leaves: leaves,
+				Root:   root,
+				Store:  store,
+			}
+		}(m)
 	}
+	wg.Wait()
 
 	r.mc.RecordSubtreeSeal(time.Since(t0))
 
@@ -187,73 +195,111 @@ func (r *Registry) sealSubtree(subtreeIdx int, baseTxids []chainhash.Hash) {
 	}
 	r.mu.Unlock()
 
-	// Pre-compute miner-0 proofs using STUMP XOR indexing.
+	// ── Pre-compute miner-0 proofs using STUMP XOR indexing ──────────────────
 	t1 := time.Now()
 	miner0 := minerSubs[0]
 
+	// Batch all txid→token lookups in a single transaction.
+	tokens := r.txidIndex.BatchGet(baseTxids)
+
 	// Build a reverse-index: txid → local position in miner-0's ordering.
-	localIdx := make(map[chainhash.Hash]int, cfg.HashesPerSubtree)
+	localIdx := make(map[chainhash.Hash]int, len(miner0.Leaves))
 	for i, h := range miner0.Leaves {
 		localIdx[h] = i
 	}
 
 	start := subtreeIdx * cfg.HashesPerSubtree
 
-	// Group proofs by XOR key using the txidIndex (O(1) per txid lookup).
-	tokenProofsByKey := make(map[stump.Key][]*stump.Entry)
-
-	// Flush buffered txid→token writes before reading them back.
-	if buf, ok := r.txidIndex.(*diskstore.BufferedTxIDIndex); ok {
-		buf.Flush()
+	// Parallel proof computation: split baseTxids across workers.
+	numWorkers := runtime.NumCPU()
+	if numWorkers > len(baseTxids) {
+		numWorkers = len(baseTxids)
 	}
+	chunkSize := (len(baseTxids) + numWorkers - 1) / numWorkers
 
-	for _, txid := range baseTxids {
-		token, ok := r.txidIndex.Get(txid)
-		if !ok {
-			continue
-		}
-		li, ok := localIdx[txid]
-		if !ok {
-			continue
-		}
-		sp, err := subtree.GetProofFromStore(miner0.Leaves, miner0.Store, li)
-		if err != nil {
-			slog.Error("proof generation failed", "err", err)
-			continue
-		}
-
-		th, _ := r.tokenReg.Hash(token)
-		key := stump.XORKey(th, miner0.Root)
-		tokenProofsByKey[key] = append(tokenProofsByKey[key], &stump.Entry{
-			TxID:        txid,
-			SubtreeIdx:  subtreeIdx,
-			LocalIdx:    li,
-			GlobalIdx:   start + li,
-			SiblingPath: sp,
-		})
+	type keyEntries struct {
+		key     stump.Key
+		entries []*stump.Entry
 	}
+	// Each worker produces its own map to avoid contention.
+	workerResults := make([]map[stump.Key][]*stump.Entry, numWorkers)
 
-	// Batch-append STUMP entries to disk.
-	for key, entries := range tokenProofsByKey {
-		r.stumpStore.AppendBatch(key, entries)
+	wg.Add(numWorkers)
+	for w := 0; w < numWorkers; w++ {
+		go func(w int) {
+			defer wg.Done()
+			lo := w * chunkSize
+			hi := lo + chunkSize
+			if hi > len(baseTxids) {
+				hi = len(baseTxids)
+			}
+			local := make(map[stump.Key][]*stump.Entry)
+			for i := lo; i < hi; i++ {
+				tok := tokens[i]
+				if tok == "" {
+					continue
+				}
+				txid := baseTxids[i]
+				li, ok := localIdx[txid]
+				if !ok {
+					continue
+				}
+				sp, err := subtree.GetProofFromStore(miner0.Leaves, miner0.Store, li)
+				if err != nil {
+					continue
+				}
+
+				th, _ := r.tokenReg.Hash(tok)
+				key := stump.XORKey(th, miner0.Root)
+				local[key] = append(local[key], &stump.Entry{
+					TxID:        txid,
+					SubtreeIdx:  subtreeIdx,
+					LocalIdx:    li,
+					GlobalIdx:   start + li,
+					SiblingPath: sp,
+				})
+			}
+			workerResults[w] = local
+		}(w)
+	}
+	wg.Wait()
+
+	// Merge worker results and batch-write ALL keys to disk in one WriteBatch.
+	merged := make(map[stump.Key][]*stump.Entry)
+	for _, wr := range workerResults {
+		for key, entries := range wr {
+			merged[key] = append(merged[key], entries...)
+		}
+	}
+	if ds, ok := r.stumpStore.(*diskstore.DiskStumpStore); ok {
+		ds.AppendMultiKeyBatch(merged)
+	} else {
+		for key, entries := range merged {
+			r.stumpStore.AppendBatch(key, entries)
+		}
 	}
 
 	r.mc.RecordProofCompute(time.Since(t1))
 
 	slog.Info("proofs pre-computed (STUMP indexed)",
 		"subtreeIdx", subtreeIdx,
-		"stumpKeys", len(tokenProofsByKey),
+		"stumpKeys", len(merged),
 		"proofDuration", time.Since(t1),
 	)
 
 	// Evict MinerSubtree internals to disk to free RAM.
-	// Must happen AFTER proof pre-computation which reads Leaves/Store.
+	// At 1M leaves/subtree, each is ~64MB — must evict for 600-subtree blocks.
+	wg.Add(cfg.NumMiners)
 	for m := 0; m < cfg.NumMiners; m++ {
-		ms := minerSubs[m]
-		r.minerSubStore.Save(m, subtreeIdx, hashSliceToBytes(ms.Leaves), hashSliceToBytes(ms.Store))
-		ms.Leaves = nil
-		ms.Store = nil
+		go func(m int) {
+			defer wg.Done()
+			ms := minerSubs[m]
+			r.minerSubStore.Save(m, subtreeIdx, hashSliceToBytes(ms.Leaves), hashSliceToBytes(ms.Store))
+			ms.Leaves = nil
+			ms.Store = nil
+		}(m)
 	}
+	wg.Wait()
 }
 
 // finalizeBlock simulates block discovery: replaces the coinbase placeholder
@@ -375,39 +421,13 @@ func (r *Registry) finalizeBlock() *BlockFinalizedEvent {
 		"recomputedProofs", recomputedProofs,
 	)
 
-	// ── STUMP Discovery ─────────────────────────────────────────────────────
-	// Use the XOR probe to gather all proofs per token.
-	// This replaces the old approach of copying tokenProofs directly.
-	t1 := time.Now()
-
+	// ── Prepare finalization event ──────────────────────────────────────────
+	// Instead of copying all proofs, pass the stump store and token registry
+	// to the BUMP assembly pipeline for on-demand, per-token XOR probing.
 	m0 := r.minerSubtrees[0]
 	roots := make([]chainhash.Hash, len(m0))
 	for i, ms := range m0 {
 		roots[i] = ms.Root
-	}
-
-	// Discover matching STUMPs: O(subtrees × tokens) XOR probes.
-	discovered := stump.Discover(r.stumpStore, r.tokenReg, roots)
-
-	slog.Info("STUMP discovery complete",
-		"tokens", len(discovered),
-		"duration", time.Since(t1),
-	)
-
-	// Convert discovered entries to SubtreeProofs for BUMP assembly.
-	proofs := make(map[string][]*SubtreeProof, len(discovered))
-	for tok, entries := range discovered {
-		sp := make([]*SubtreeProof, len(entries))
-		for i, e := range entries {
-			sp[i] = &SubtreeProof{
-				TxID:        e.TxID,
-				SubtreeIdx:  e.SubtreeIdx,
-				LocalIdx:    e.LocalIdx,
-				GlobalIdx:   e.GlobalIdx,
-				SiblingPath: e.SiblingPath,
-			}
-		}
-		proofs[tok] = sp
 	}
 
 	cbs := make(map[string]CallbackInfo, len(r.tokenCallback))
@@ -417,8 +437,9 @@ func (r *Registry) finalizeBlock() *BlockFinalizedEvent {
 
 	return &BlockFinalizedEvent{
 		SubtreeRoots: roots,
-		TokenProofs:  proofs,
 		Callbacks:    cbs,
+		StumpStore:   r.stumpStore,
+		TokenReg:     r.tokenReg,
 	}
 }
 
@@ -477,3 +498,4 @@ func bytesToHashSlice(data []byte) []chainhash.Hash {
 	}
 	return result
 }
+

@@ -100,6 +100,9 @@ type StumpStore interface {
 type TxIDIndexer interface {
 	Set(txid chainhash.Hash, token string)
 	Get(txid chainhash.Hash) (string, bool)
+	// BatchGet looks up multiple txids in a single pass. Returns a slice
+	// parallel to txids with the token for each (empty string if not found).
+	BatchGet(txids []chainhash.Hash) []string
 	Len() int
 }
 

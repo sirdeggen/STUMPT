@@ -87,6 +87,46 @@ func (s *DiskStumpStore) AppendBatch(key stump.Key, entries []*stump.Entry) {
 	}
 }
 
+// AppendMultiKeyBatch writes entries across multiple XOR keys using WriteBatches.
+// Entries are written in chunks to avoid overwhelming BadgerDB with a single huge batch.
+func (s *DiskStumpStore) AppendMultiKeyBatch(batch map[stump.Key][]*stump.Entry) {
+	if len(batch) == 0 {
+		return
+	}
+
+	const maxPerBatch = 50_000 // entries per WriteBatch flush
+
+	wb := s.db.BadgerDB().NewWriteBatch()
+	count := 0
+	for key, entries := range batch {
+		for _, e := range entries {
+			seq := s.seq.Add(1)
+			dbKey := makeDBKey(key, seq)
+			val := MarshalEntry(e)
+			if err := wb.Set(dbKey, val); err != nil {
+				slog.Error("DiskStumpStore.AppendMultiKeyBatch set failed", "error", err)
+				wb.Cancel()
+				return
+			}
+			count++
+			if count >= maxPerBatch {
+				if err := wb.Flush(); err != nil {
+					slog.Error("DiskStumpStore.AppendMultiKeyBatch flush failed", "error", err)
+					return
+				}
+				wb = s.db.BadgerDB().NewWriteBatch()
+				count = 0
+			}
+		}
+	}
+
+	if count > 0 {
+		if err := wb.Flush(); err != nil {
+			slog.Error("DiskStumpStore.AppendMultiKeyBatch flush failed", "error", err)
+		}
+	}
+}
+
 // Get returns all entries stored under the given XOR key.
 // Returns nil if no entries exist.
 func (s *DiskStumpStore) Get(key stump.Key) []*stump.Entry {

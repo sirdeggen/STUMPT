@@ -16,6 +16,7 @@ import (
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	gosdk "github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/bsv-blockchain/stumpt/internal/metrics"
+	"github.com/bsv-blockchain/stumpt/internal/stump"
 	"github.com/bsv-blockchain/stumpt/internal/subtree"
 )
 
@@ -48,34 +49,26 @@ func processBUMPs(
 		"duration", time.Since(t0),
 	)
 
-	// Assemble compound BUMPs using a parallel worker pool.
-	// BUMP assembly is embarrassingly parallel: each token's BUMP is
-	// independent. We use min(GOMAXPROCS, numTokens) workers.
+	// Assemble and deliver BUMPs in a streaming pipeline.
+	// Workers build BUMPs and immediately hand them off for delivery,
+	// avoiding accumulating all BUMP byte slices in memory at once.
 	t1 := time.Now()
-	type result struct {
+	type tokenWork struct {
 		token string
 		cb    CallbackInfo
-		data  []byte
-	}
-
-	// Collect all tokens into a slice for deterministic ordering.
-	type tokenWork struct {
-		token  string
-		cb     CallbackInfo
-		proofs []*SubtreeProof
 	}
 	work := make([]tokenWork, 0, len(evt.Callbacks))
 	for token, cb := range evt.Callbacks {
-		proofs := evt.TokenProofs[token]
-		if len(proofs) == 0 {
-			slog.Warn("no proofs for token, skipping", "token", token)
-			continue
-		}
-		work = append(work, tokenWork{token: token, cb: cb, proofs: proofs})
+		work = append(work, tokenWork{token: token, cb: cb})
 	}
 
 	total := len(work)
+	// Limit BUMP assembly concurrency to cap peak memory.
+	// Each worker holds a full BUMP's worth of maps + serialized bytes.
 	numWorkers := runtime.GOMAXPROCS(0)
+	if numWorkers > 4 {
+		numWorkers = 4 // cap to avoid OOM from concurrent large BUMPs
+	}
 	if numWorkers > total {
 		numWorkers = total
 	}
@@ -88,23 +81,71 @@ func processBUMPs(
 		"workers", numWorkers,
 	)
 
-	results := make([]result, total)
-	var wg sync.WaitGroup
+	type deliveryItem struct {
+		token string
+		cb    CallbackInfo
+		data  []byte
+	}
+
+	// Streaming pipeline: build workers → delivery channel → delivery workers.
+	deliverCh := make(chan deliveryItem, numWorkers*2)
 	workCh := make(chan int, total)
 
 	// Track progress atomically.
 	var doneCount sync.Mutex
 	done := 0
+	dumped := false
 
-	// Launch workers.
-	for w := 0; w < numWorkers; w++ {
-		wg.Add(1)
+	client := &http.Client{Timeout: 15 * time.Second}
+	blockTime := time.Now()
+
+	// Start delivery workers first.
+	deliveryWorkers := numWorkers
+	if deliveryWorkers > 32 {
+		deliveryWorkers = 32
+	}
+	var deliverWg sync.WaitGroup
+	deliverWg.Add(deliveryWorkers)
+	for w := 0; w < deliveryWorkers; w++ {
 		go func() {
-			defer wg.Done()
+			defer deliverWg.Done()
+			for item := range deliverCh {
+				deliverBUMP(ctx, client, mc, item.cb, item.token, item.data, blockTime)
+			}
+		}()
+	}
+
+	// Launch build workers.
+	var buildWg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		buildWg.Add(1)
+		go func() {
+			defer buildWg.Done()
 			for idx := range workCh {
 				tw := work[idx]
+
+				// On-demand discovery: probe stump store for this token's entries.
+				th, _ := evt.TokenReg.Hash(tw.token)
+				var proofs []*SubtreeProof
+				for _, root := range evt.SubtreeRoots {
+					key := stump.XORKey(th, root)
+					entries := evt.StumpStore.Get(key)
+					for _, e := range entries {
+						proofs = append(proofs, &SubtreeProof{
+							TxID:        e.TxID,
+							SubtreeIdx:  e.SubtreeIdx,
+							LocalIdx:    e.LocalIdx,
+							GlobalIdx:   e.GlobalIdx,
+							SiblingPath: e.SiblingPath,
+						})
+					}
+				}
+				if len(proofs) == 0 {
+					continue
+				}
+
 				bump, err := buildCompoundBUMP(
-					blockHeight, tw.proofs, topProofs,
+					blockHeight, proofs, topProofs,
 					subtreeHeight, topTreeHeight, totalHeight,
 				)
 				if err != nil {
@@ -112,9 +153,23 @@ func processBUMPs(
 					continue
 				}
 				bumpBytes := bump.Bytes()
-				results[idx] = result{token: tw.token, cb: tw.cb, data: bumpBytes}
 
-				// Log progress every 10% for large token counts.
+				// Dump first BUMP if requested.
+				if dumpFile != "" {
+					doneCount.Lock()
+					if !dumped {
+						dumped = true
+						doneCount.Unlock()
+						dumpBUMPHex(dumpFile, tw.token, bumpBytes)
+					} else {
+						doneCount.Unlock()
+					}
+				}
+
+				// Stream to delivery immediately — don't accumulate.
+				deliverCh <- deliveryItem{token: tw.token, cb: tw.cb, data: bumpBytes}
+
+				// Log progress every 10%.
 				doneCount.Lock()
 				done++
 				d := done
@@ -135,7 +190,8 @@ func processBUMPs(
 		workCh <- i
 	}
 	close(workCh)
-	wg.Wait()
+	buildWg.Wait()
+	close(deliverCh)
 
 	mc.RecordBUMPAssembly(time.Since(t1))
 	slog.Info("BUMPs assembled",
@@ -144,25 +200,7 @@ func processBUMPs(
 		"assemblyDuration", time.Since(t1),
 	)
 
-	// Dump the first non-empty BUMP to file as hex if requested.
-	if dumpFile != "" {
-		for _, r := range results {
-			if len(r.data) > 0 {
-				dumpBUMPHex(dumpFile, r.token, r.data)
-				break
-			}
-		}
-	}
-
-	// Deliver each BUMP to the callback URL.
-	client := &http.Client{Timeout: 15 * time.Second}
-	blockTime := time.Now()
-	for _, r := range results {
-		if len(r.data) == 0 {
-			continue
-		}
-		deliverBUMP(ctx, client, mc, r.cb, r.token, r.data, blockTime)
-	}
+	deliverWg.Wait()
 }
 
 // buildCompoundBUMP creates a single MerklePath that covers all of a token's
@@ -187,9 +225,13 @@ func buildCompoundBUMP(
 	}
 
 	// merged[level][offset] = PathElement
+	// Pre-allocate with estimated capacity: level 0 has ~2× proofs (txid + sibling),
+	// higher levels have ~1 entry per proof (siblings deduplicate).
+	numProofs := len(proofs)
 	merged := make([]map[uint64]*gosdk.PathElement, totalHeight)
-	for i := range merged {
-		merged[i] = make(map[uint64]*gosdk.PathElement)
+	merged[0] = make(map[uint64]*gosdk.PathElement, numProofs*2)
+	for i := 1; i < totalHeight; i++ {
+		merged[i] = make(map[uint64]*gosdk.PathElement, numProofs)
 	}
 
 	// Accumulate all elements from every per-txid proof.

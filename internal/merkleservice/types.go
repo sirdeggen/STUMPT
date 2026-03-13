@@ -1,6 +1,9 @@
 package merkleservice
 
-import "github.com/bsv-blockchain/go-sdk/chainhash"
+import (
+	"github.com/bsv-blockchain/go-sdk/chainhash"
+	"github.com/bsv-blockchain/stumpt/internal/stump"
+)
 
 // WatchRequest is the JSON body of POST /watch.
 type WatchRequest struct {
@@ -36,12 +39,13 @@ type MinerSubtree struct {
 
 // BlockFinalizedEvent is sent to the BUMP processor when all txids have arrived.
 type BlockFinalizedEvent struct {
-	// SubtreeRoots is the ordered list of miner-0 subtree roots (60 entries).
-	// These are the leaves of the top tree.
+	// SubtreeRoots is the ordered list of miner-0 subtree roots.
 	SubtreeRoots []chainhash.Hash
-	// TokenProofs maps each token to its list of pre-computed SubtreeProofs
-	// (one entry per txid submitted under that token, miner-0 ordering).
-	TokenProofs map[string][]*SubtreeProof
 	// Callbacks maps each token to its callback delivery target.
 	Callbacks map[string]CallbackInfo
+	// StumpStore provides on-demand access to per-token proofs via XOR probing.
+	// BUMP assembly queries this directly rather than copying all proofs.
+	StumpStore stump.StumpStore
+	// TokenReg provides token→hash mappings for XOR key computation.
+	TokenReg *stump.TokenRegistry
 }
