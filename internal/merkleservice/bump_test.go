@@ -1,7 +1,9 @@
 package merkleservice
 
 import (
+	"bytes"
 	"crypto/rand"
+	"fmt"
 	"testing"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
@@ -72,6 +74,142 @@ func setupBUMPBenchmark(numSubtrees, subtreeSize, proofsPerToken int) (
 	}
 
 	return
+}
+
+// setupFastBenchmark creates data structures for assembleTokenBUMPFast testing.
+// Returns positions, subtreeMap, topProofs, and tree dimensions.
+func setupFastBenchmark(numSubtrees, subtreeSize, proofsPerToken int) (
+	positions []leafPos,
+	subtreeMap map[int]*cachedSubtree,
+	topProofs [][]*chainhash.Hash,
+	subtreeHeight, topTreeHeight, totalHeight int,
+) {
+	subtreeHeight = subtree.Log2Ceil(subtreeSize)
+	topTreeHeight = subtree.Log2Ceil(numSubtrees)
+	totalHeight = subtreeHeight + topTreeHeight
+
+	subtreeLeaves := make([][]chainhash.Hash, numSubtrees)
+	subtreeStores := make([][]chainhash.Hash, numSubtrees)
+	roots := make([]chainhash.Hash, numSubtrees)
+
+	for s := 0; s < numSubtrees; s++ {
+		subtreeLeaves[s] = randomLeaves(subtreeSize)
+		subtreeStores[s] = subtree.BuildMerkleStore(subtreeLeaves[s])
+		roots[s] = subtreeStores[s][len(subtreeStores[s])-1]
+	}
+
+	topProofs, err := subtree.GetAllProofs(roots)
+	if err != nil {
+		panic(err)
+	}
+
+	// Build subtreeMap and positions.
+	subtreeMap = make(map[int]*cachedSubtree, numSubtrees)
+	for s := 0; s < numSubtrees; s++ {
+		subtreeMap[s] = &cachedSubtree{
+			Leaves: subtreeLeaves[s],
+			Store:  subtreeStores[s],
+		}
+	}
+
+	proofsPerSubtree := proofsPerToken / numSubtrees
+	if proofsPerSubtree < 1 {
+		proofsPerSubtree = 1
+	}
+
+	positions = make([]leafPos, 0, proofsPerToken)
+	for s := 0; s < numSubtrees && len(positions) < proofsPerToken; s++ {
+		for i := 0; i < proofsPerSubtree && len(positions) < proofsPerToken; i++ {
+			localIdx := i % subtreeSize
+			positions = append(positions, leafPos{
+				subtreeIdx: s,
+				localIdx:   localIdx,
+				globalIdx:  s*subtreeSize + localIdx,
+			})
+		}
+	}
+
+	return
+}
+
+// TestFastVsLegacyBUMP verifies that assembleTokenBUMPFast produces identical
+// BUMP binary output to assembleTokenBUMP + MerklePath.Bytes().
+func TestFastVsLegacyBUMP(t *testing.T) {
+	tests := []struct {
+		name       string
+		numST      int
+		stSize     int
+		numProofs  int
+	}{
+		{"4st_16leaf_8proof", 4, 16, 8},
+		{"8st_64leaf_40proof", 8, 64, 40},
+		{"16st_128leaf_100proof", 16, 128, 100},
+		{"4st_256leaf_200proof", 4, 256, 200},
+		{"2st_32leaf_4proof", 2, 32, 4},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			positions, subtreeMap, topProofs, sh, tth, th := setupFastBenchmark(tc.numST, tc.stSize, tc.numProofs)
+
+			// Legacy path: assembleTokenBUMP + Bytes().
+			legacyBump, err := assembleTokenBUMP(
+				800_000, positions, subtreeMap, topProofs, sh, tth, th,
+			)
+			if err != nil {
+				t.Fatalf("legacy assembleTokenBUMP failed: %v", err)
+			}
+			legacyBytes := legacyBump.Bytes()
+
+			// Fast path: assembleTokenBUMPFast (returns bytes directly).
+			ws := newWorkerState(th)
+			fastBytes, err := assembleTokenBUMPFast(
+				800_000, positions, subtreeMap, topProofs, sh, tth, th, ws,
+			)
+			if err != nil {
+				t.Fatalf("fast assembleTokenBUMPFast failed: %v", err)
+			}
+
+			if !bytes.Equal(legacyBytes, fastBytes) {
+				t.Errorf("BUMP bytes differ: legacy=%d bytes, fast=%d bytes", len(legacyBytes), len(fastBytes))
+				// Show first divergence point.
+				minLen := len(legacyBytes)
+				if len(fastBytes) < minLen {
+					minLen = len(fastBytes)
+				}
+				for i := 0; i < minLen; i++ {
+					if legacyBytes[i] != fastBytes[i] {
+						t.Errorf("first diff at byte %d: legacy=0x%02x fast=0x%02x", i, legacyBytes[i], fastBytes[i])
+						break
+					}
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkAssembleTokenBUMPFast benchmarks the new fast path.
+func BenchmarkAssembleTokenBUMPFast(b *testing.B) {
+	configs := []struct {
+		name  string
+		numST int
+		stSz  int
+		nProof int
+	}{
+		{"10proof_16st", 16, 64, 10},
+		{"600proof_60st", 60, 1024, 600},
+		{"6000proof_600st", 600, 1000, 6000},
+	}
+	for _, c := range configs {
+		b.Run(fmt.Sprintf("fast_%s", c.name), func(b *testing.B) {
+			pos, stMap, tp, sh, tth, th := setupFastBenchmark(c.numST, c.stSz, c.nProof)
+			ws := newWorkerState(th)
+			b.ResetTimer()
+			for range b.N {
+				_, _ = assembleTokenBUMPFast(800_000, pos, stMap, tp, sh, tth, th, ws)
+			}
+		})
+	}
 }
 
 // BenchmarkBuildCompoundBUMP_10proofs_16subtrees benchmarks compound BUMP
