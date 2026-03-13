@@ -3,6 +3,7 @@ package diskstore
 import (
 	"encoding/binary"
 	"fmt"
+	"sync"
 	"sync/atomic"
 
 	badger "github.com/dgraph-io/badger/v4"
@@ -65,6 +66,112 @@ func (tl *TxidList) Append(h chainhash.Hash) error {
 	}
 	tl.len.Add(1)
 	return nil
+}
+
+// BufferedTxidList wraps a TxidList with an in-memory write buffer that
+// flushes to disk in batches, avoiding per-append transaction overhead.
+type BufferedTxidList struct {
+	inner   *TxidList
+	buf     []chainhash.Hash
+	bufSize int
+	mu      sync.Mutex
+}
+
+// NewBufferedTxidList creates a BufferedTxidList with the given flush threshold.
+func NewBufferedTxidList(db *DB, bufSize int) *BufferedTxidList {
+	if bufSize <= 0 {
+		bufSize = 1000
+	}
+	return &BufferedTxidList{
+		inner:   NewTxidList(db),
+		buf:     make([]chainhash.Hash, 0, bufSize),
+		bufSize: bufSize,
+	}
+}
+
+// Append adds a hash to the buffer. Flushes to disk when the buffer is full.
+func (bl *BufferedTxidList) Append(h chainhash.Hash) error {
+	bl.mu.Lock()
+	bl.buf = append(bl.buf, h)
+	if len(bl.buf) >= bl.bufSize {
+		err := bl.flushLocked()
+		bl.mu.Unlock()
+		return err
+	}
+	bl.mu.Unlock()
+	return nil
+}
+
+// Flush writes any buffered entries to disk.
+func (bl *BufferedTxidList) Flush() error {
+	bl.mu.Lock()
+	defer bl.mu.Unlock()
+	return bl.flushLocked()
+}
+
+func (bl *BufferedTxidList) flushLocked() error {
+	if len(bl.buf) == 0 {
+		return nil
+	}
+	wb := bl.inner.db.db.NewWriteBatch()
+	baseIdx := bl.inner.len.Load()
+	for i, h := range bl.buf {
+		key := makeKey(baseIdx + int64(i))
+		val := make([]byte, 32)
+		copy(val, h[:])
+		if err := wb.Set(key, val); err != nil {
+			wb.Cancel()
+			return fmt.Errorf("diskstore: buffered_txid_list flush: %w", err)
+		}
+	}
+	if err := wb.Flush(); err != nil {
+		return fmt.Errorf("diskstore: buffered_txid_list flush: %w", err)
+	}
+	bl.inner.len.Add(int64(len(bl.buf)))
+	bl.buf = bl.buf[:0]
+	return nil
+}
+
+// Get retrieves the hash at the given index, checking the buffer first.
+func (bl *BufferedTxidList) Get(index int) (chainhash.Hash, bool) {
+	bl.mu.Lock()
+	diskLen := int(bl.inner.len.Load())
+	if index >= diskLen && index < diskLen+len(bl.buf) {
+		h := bl.buf[index-diskLen]
+		bl.mu.Unlock()
+		return h, true
+	}
+	bl.mu.Unlock()
+	return bl.inner.Get(index)
+}
+
+// Set overwrites the hash at the given index. Flushes buffer first if needed.
+func (bl *BufferedTxidList) Set(index int, h chainhash.Hash) error {
+	bl.mu.Lock()
+	diskLen := int(bl.inner.len.Load())
+	if index >= diskLen && index < diskLen+len(bl.buf) {
+		bl.buf[index-diskLen] = h
+		bl.mu.Unlock()
+		return nil
+	}
+	bl.mu.Unlock()
+	return bl.inner.Set(index, h)
+}
+
+// Slice returns hashes in the half-open range [start, end).
+// Flushes the buffer first to ensure consistency.
+func (bl *BufferedTxidList) Slice(start, end int) []chainhash.Hash {
+	bl.mu.Lock()
+	_ = bl.flushLocked()
+	bl.mu.Unlock()
+	return bl.inner.Slice(start, end)
+}
+
+// Len returns the total number of entries (disk + buffer).
+func (bl *BufferedTxidList) Len() int {
+	bl.mu.Lock()
+	defer bl.mu.Unlock()
+	return int(bl.inner.len.Load()) + len(bl.buf)
 }
 
 // Get retrieves the hash at the given index. Returns false if out of range.

@@ -23,27 +23,21 @@ type Registry struct {
 	cfg *config.Config
 	mc  *metrics.Collector
 
-	// Disk-backed ordered list of every received txid.
-	txidList *diskstore.TxidList
+	// Disk-backed ordered list of every received txid (buffered writes).
+	txidList *diskstore.BufferedTxidList
 
 	// per-token callback targets.
 	tokenCallback map[string]CallbackInfo
 
 	// minerSubtrees[minerIdx] is the ordered list of sealed subtrees for that miner.
+	// Only Root is retained in memory; Leaves/Store are evicted to disk after sealing.
 	minerSubtrees [][]*MinerSubtree
 
 	// ── STUMP indexing ──────────────────────────────────────────────────
 	// XOR-indexed STUMP store: key = XOR(tokenHash, subtreeRoot).
-	// Replaces the old O(tokens × txids/token) per-subtree scan with
-	// O(1) per-txid insertion and O(subtrees × tokens) XOR probing at
-	// block announcement.
 	stumpStore stump.StumpStore
 	txidIndex  stump.TxIDIndexer
 	tokenReg   *stump.TokenRegistry
-
-	// Legacy tokenProofs kept for coinbase-reseal recomputation of
-	// subtree-0 proofs (only subtree-0 entries are recomputed).
-	tokenProofs map[string][]*SubtreeProof
 
 	// blockCh is closed once the block is complete, signalling the server.
 	blockCh chan *BlockFinalizedEvent
@@ -57,13 +51,12 @@ func newRegistry(cfg *config.Config, mc *metrics.Collector, db *diskstore.DB) *R
 	return &Registry{
 		cfg:           cfg,
 		mc:            mc,
-		txidList:      diskstore.NewTxidList(db),
+		txidList:      diskstore.NewBufferedTxidList(db, 1000),
 		tokenCallback: make(map[string]CallbackInfo),
 		minerSubtrees: make([][]*MinerSubtree, cfg.NumMiners),
 		stumpStore:    diskstore.NewDiskStumpStore(db),
 		txidIndex:     diskstore.NewBufferedTxIDIndex(db, 1000),
 		tokenReg:      stump.NewTokenRegistry(),
-		tokenProofs:   make(map[string][]*SubtreeProof),
 		blockCh:       make(chan *BlockFinalizedEvent, 1),
 		minerSubStore: diskstore.NewMinerSubtreeStore(db),
 	}
@@ -206,14 +199,8 @@ func (r *Registry) sealSubtree(subtreeIdx int, baseTxids []chainhash.Hash) {
 
 	start := subtreeIdx * cfg.HashesPerSubtree
 
-	// Group proofs by token using the txidIndex (O(1) per txid lookup)
-	// instead of iterating all tokens.
-	type tokenProofPair struct {
-		token string
-		proof *SubtreeProof
-	}
+	// Group proofs by XOR key using the txidIndex (O(1) per txid lookup).
 	tokenProofsByKey := make(map[stump.Key][]*stump.Entry)
-	var legacyProofs []tokenProofPair
 
 	// Flush buffered txid→token writes before reading them back.
 	if buf, ok := r.txidIndex.(*diskstore.BufferedTxIDIndex); ok {
@@ -235,41 +222,21 @@ func (r *Registry) sealSubtree(subtreeIdx int, baseTxids []chainhash.Hash) {
 			continue
 		}
 
-		txidCopy := txid
-		subProof := &SubtreeProof{
-			TxID:        txidCopy,
-			SubtreeIdx:  subtreeIdx,
-			LocalIdx:    li,
-			GlobalIdx:   start + li,
-			SiblingPath: sp,
-		}
-
-		// STUMP XOR index entry.
 		th, _ := r.tokenReg.Hash(token)
 		key := stump.XORKey(th, miner0.Root)
 		tokenProofsByKey[key] = append(tokenProofsByKey[key], &stump.Entry{
-			TxID:        txidCopy,
+			TxID:        txid,
 			SubtreeIdx:  subtreeIdx,
 			LocalIdx:    li,
 			GlobalIdx:   start + li,
 			SiblingPath: sp,
 		})
-
-		// Also accumulate in legacy tokenProofs for coinbase reseal.
-		legacyProofs = append(legacyProofs, tokenProofPair{token: token, proof: subProof})
 	}
 
-	// Batch-append STUMP entries.
+	// Batch-append STUMP entries to disk.
 	for key, entries := range tokenProofsByKey {
 		r.stumpStore.AppendBatch(key, entries)
 	}
-
-	// Merge into legacy proof map (for coinbase reseal of subtree-0).
-	r.mu.Lock()
-	for _, tp := range legacyProofs {
-		r.tokenProofs[tp.token] = append(r.tokenProofs[tp.token], tp.proof)
-	}
-	r.mu.Unlock()
 
 	r.mc.RecordProofCompute(time.Since(t1))
 
@@ -349,7 +316,9 @@ func (r *Registry) finalizeBlock() *BlockFinalizedEvent {
 
 	newSubtree0Root := r.minerSubtrees[0][0].Root
 
-	// Recompute miner-0 proofs for all tokens that had txids in subtree-0.
+	// Recompute subtree-0 proofs using the stumpStore (no in-memory tokenProofs needed).
+	// For each token, probe the old XOR key to get subtree-0 entries,
+	// recompute proofs with the new leaves, and insert under the new XOR key.
 	miner0 := r.minerSubtrees[0][0]
 	localIdx := make(map[chainhash.Hash]int, r.cfg.HashesPerSubtree)
 	for i, h := range miner0.Leaves {
@@ -357,41 +326,6 @@ func (r *Registry) finalizeBlock() *BlockFinalizedEvent {
 	}
 
 	recomputedProofs := 0
-	for tok, proofList := range r.tokenProofs {
-		for i, p := range proofList {
-			if p.SubtreeIdx != 0 {
-				continue
-			}
-			txid := p.TxID
-			if txid == oldCoinbase {
-				txid = coinbase
-			}
-			li, ok := localIdx[txid]
-			if !ok {
-				slog.Error("coinbase reseal: txid not found in miner-0 subtree-0",
-					"token", tok, "txid", hex.EncodeToString(txid[:8]))
-				continue
-			}
-			sp, err := subtree.GetProofFromStore(miner0.Leaves, miner0.Store, li)
-			if err != nil {
-				slog.Error("coinbase reseal: proof recomputation failed",
-					"token", tok, "err", err)
-				continue
-			}
-			r.tokenProofs[tok][i] = &SubtreeProof{
-				TxID:        txid,
-				SubtreeIdx:  0,
-				LocalIdx:    li,
-				GlobalIdx:   li,
-				SiblingPath: sp,
-			}
-			recomputedProofs++
-		}
-	}
-
-	// Update STUMP store: remove old subtree-0 entries and re-insert with
-	// the new root. For each token that had entries under
-	// XOR(tokenHash, oldRoot), we need entries under XOR(tokenHash, newRoot).
 	tokens := r.tokenReg.Tokens()
 	for _, token := range tokens {
 		th, _ := r.tokenReg.Hash(token)
@@ -401,20 +335,33 @@ func (r *Registry) finalizeBlock() *BlockFinalizedEvent {
 			continue
 		}
 
-		// Build new entries with recomputed proofs from tokenProofs.
 		newKey := stump.XORKey(th, newSubtree0Root)
 		newEntries := make([]*stump.Entry, 0, len(oldEntries))
-		for _, p := range r.tokenProofs[token] {
-			if p.SubtreeIdx != 0 {
+		for _, e := range oldEntries {
+			txid := e.TxID
+			if txid == oldCoinbase {
+				txid = coinbase
+			}
+			li, ok := localIdx[txid]
+			if !ok {
+				slog.Error("coinbase reseal: txid not found in miner-0 subtree-0",
+					"token", token, "txid", hex.EncodeToString(txid[:8]))
+				continue
+			}
+			sp, err := subtree.GetProofFromStore(miner0.Leaves, miner0.Store, li)
+			if err != nil {
+				slog.Error("coinbase reseal: proof recomputation failed",
+					"token", token, "err", err)
 				continue
 			}
 			newEntries = append(newEntries, &stump.Entry{
-				TxID:        p.TxID,
-				SubtreeIdx:  p.SubtreeIdx,
-				LocalIdx:    p.LocalIdx,
-				GlobalIdx:   p.GlobalIdx,
-				SiblingPath: p.SiblingPath,
+				TxID:        txid,
+				SubtreeIdx:  0,
+				LocalIdx:    li,
+				GlobalIdx:   li,
+				SiblingPath: sp,
 			})
+			recomputedProofs++
 		}
 		if len(newEntries) > 0 {
 			r.stumpStore.AppendBatch(newKey, newEntries)

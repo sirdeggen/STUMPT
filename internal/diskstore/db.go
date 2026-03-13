@@ -34,12 +34,12 @@ func Open(dir string) (*DB, error) {
 		WithNumVersionsToKeep(1).
 		WithCompactL0OnClose(false).
 		WithNumCompactors(2).
-		WithValueLogFileSize(256 << 20).  // 256 MB value log files
-		WithMemTableSize(64 << 20).       // 64 MB memtable
-		WithNumMemtables(2).              // Keep 2 memtables
-		WithBlockCacheSize(32 << 20).     // 32 MB block cache (required by compression)
-		WithIndexCacheSize(100 << 20).    // 100 MB index cache
-		WithDetectConflicts(false)        // No transaction conflicts expected
+		WithValueLogFileSize(64 << 20).  // 64 MB value log files
+		WithMemTableSize(8 << 20).       // 8 MB memtable (down from 64 MB)
+		WithNumMemtables(2).             // Keep 2 memtables
+		WithBlockCacheSize(16 << 20).    // 16 MB block cache
+		WithIndexCacheSize(16 << 20).    // 16 MB index cache (down from 100 MB)
+		WithDetectConflicts(false)       // No transaction conflicts expected
 
 	bdb, err := badger.Open(opts)
 	if err != nil {
