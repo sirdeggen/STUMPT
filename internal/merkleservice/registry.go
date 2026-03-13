@@ -231,19 +231,14 @@ func (r *Registry) sealSubtree(subtreeIdx int, baseTxids []chainhash.Hash) {
 		"indexDuration", time.Since(t1),
 	)
 
-	// Evict MinerSubtree internals to disk to free RAM.
-	// At 1M leaves/subtree, each is ~64MB — must evict for 600-subtree blocks.
-	wg.Add(cfg.NumMiners)
-	for m := 0; m < cfg.NumMiners; m++ {
-		go func(m int) {
-			defer wg.Done()
-			ms := minerSubs[m]
-			r.minerSubStore.Save(m, subtreeIdx, hashSliceToBytes(ms.Leaves), hashSliceToBytes(ms.Store))
-			ms.Leaves = nil
-			ms.Store = nil
-		}(m)
+	// Keep miner-0 subtrees in memory for fast BUMP assembly.
+	// Evict miners 1+ to disk to save RAM (only needed for coinbase reseal of subtree-0).
+	for m := 1; m < cfg.NumMiners; m++ {
+		ms := minerSubs[m]
+		r.minerSubStore.Save(m, subtreeIdx, hashSliceToBytes(ms.Leaves), hashSliceToBytes(ms.Store))
+		ms.Leaves = nil
+		ms.Store = nil
 	}
-	wg.Wait()
 }
 
 // finalizeBlock simulates block discovery: replaces the coinbase placeholder
@@ -329,10 +324,11 @@ func (r *Registry) finalizeBlock() *BlockFinalizedEvent {
 	}
 
 	return &BlockFinalizedEvent{
-		SubtreeRoots:    roots,
-		Callbacks:       cbs,
-		TokenSubtreeIdx: r.tokenSubtreeIdx,
-		MinerSubStore:   r.minerSubStore,
+		SubtreeRoots:     roots,
+		Callbacks:        cbs,
+		TokenSubtreeIdx:  r.tokenSubtreeIdx,
+		Miner0Subtrees:   r.minerSubtrees[0],
+		MinerSubStore:    r.minerSubStore,
 		HashesPerSubtree: r.cfg.HashesPerSubtree,
 	}
 }

@@ -15,15 +15,17 @@
 //
 // Flags:
 //
-//	-hashes-per-block   N    default 1024
-//	-hashes-per-subtree N    default 64  (must divide hashes-per-block)
+//	-hashes-per-block   N    default auto-detected from RAM (1M-leaf subtrees × available memory)
+//	-hashes-per-subtree N    default 1048576 (1M leaves per subtree)
 //	-miners             N    default 3
-//	-businesses         N    default 100  (set to hashes-per-block for one BUMP per txid)
+//	-businesses         N    default 1000
 //	-duration           dur  default 10s  (controls txid submission rate; ignored in -direct mode)
 //	-merkle-addr        addr default :18080
 //	-callback-addr      addr default :13000
 //	-direct                  bypass HTTP for txid submission (fast path for large-scale runs)
 //	-dump-bump          path write first assembled BUMP as hex to this file
+//	-max-memory         GB   peak memory budget in GB (default: 80% of system RAM)
+//	-requirements            print system requirements table and exit
 package main
 
 import (
@@ -49,9 +51,11 @@ import (
 func main() {
 	cfg := config.Default()
 	var directMode bool
+	var showRequirements bool
+	var maxMemGB float64
 
 	flag.IntVar(&cfg.HashesPerBlock, "hashes-per-block", cfg.HashesPerBlock,
-		"Total txids per simulated block")
+		"Total txids per simulated block (default: auto-detected from RAM)")
 	flag.IntVar(&cfg.HashesPerSubtree, "hashes-per-subtree", cfg.HashesPerSubtree,
 		"Txids per subtree (must divide hashes-per-block)")
 	flag.IntVar(&cfg.NumMiners, "miners", cfg.NumMiners,
@@ -70,7 +74,31 @@ func main() {
 		"BadgerDB data directory (empty = temp dir)")
 	flag.BoolVar(&directMode, "direct", false,
 		"Bypass HTTP for txid submission (fast path for large-scale runs)")
+	flag.Float64Var(&maxMemGB, "max-memory", 0,
+		"Peak memory budget in GB (default: 80% of system RAM)")
+	flag.BoolVar(&showRequirements, "requirements", false,
+		"Print system requirements table and exit")
 	flag.Parse()
+
+	if showRequirements {
+		config.PrintSystemRequirements()
+		os.Exit(0)
+	}
+
+	// Apply max-memory override: recalculate HashesPerBlock if the user didn't
+	// explicitly set it, so the auto-detected scale fits the new budget.
+	hashesExplicit := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "hashes-per-block" {
+			hashesExplicit = true
+		}
+	})
+	if maxMemGB > 0 {
+		cfg.MaxMemoryBytes = int64(maxMemGB * float64(1<<30))
+		if !hashesExplicit {
+			cfg = config.WithMemoryBudget(cfg.MaxMemoryBytes)
+		}
+	}
 
 	// Validate
 	if cfg.HashesPerBlock <= 0 || cfg.HashesPerSubtree <= 0 {
@@ -82,6 +110,13 @@ func main() {
 			"hashes-per-block", cfg.HashesPerBlock,
 			"hashes-per-subtree", cfg.HashesPerSubtree,
 		)
+		os.Exit(1)
+	}
+
+	// Check memory budget before proceeding.
+	if err := cfg.CheckMemory(); err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		config.PrintSystemRequirements()
 		os.Exit(1)
 	}
 
@@ -108,6 +143,8 @@ func main() {
 		"submissionInterval", cfg.SubmissionInterval(),
 		"testDuration", cfg.TestDuration,
 		"directMode", directMode,
+		"estMemoryGB", fmt.Sprintf("%.1f", float64(cfg.EstimatedMemoryBytes())/(1<<30)),
+		"memBudgetGB", fmt.Sprintf("%.1f", float64(cfg.MaxMemoryBytes)/(1<<30)),
 	)
 
 	mc := metrics.NewCollector()

@@ -77,37 +77,27 @@ func processBUMPs(
 		"workers", numWorkers,
 	)
 
-	// Pre-load all miner-0 subtree stores into memory for fast BUMP assembly.
-	// At 600 subtrees × ~64MB each this is ~38GB — may need to be bounded.
-	type subtreeCache struct {
+	// Miner-0 subtrees are already in memory — use them directly.
+	// No disk loading needed for BUMP assembly.
+	type subtreeData struct {
 		Leaves []chainhash.Hash
 		Store  []chainhash.Hash
 	}
 	numSubtrees := len(evt.SubtreeRoots)
-	stCache := make([]subtreeCache, numSubtrees)
-	{
-		var cacheWg sync.WaitGroup
-		cacheWg.Add(numSubtrees)
-		for si := 0; si < numSubtrees; si++ {
-			go func(si int) {
-				defer cacheWg.Done()
-				leavesBytes, storeBytes, ok := evt.MinerSubStore.Load(0, si)
-				if !ok {
-					slog.Error("BUMP cache: failed to load subtree", "subtreeIdx", si)
-					return
-				}
-				stCache[si] = subtreeCache{
-					Leaves: bytesToHashSlice(leavesBytes),
-					Store:  bytesToHashSlice(storeBytes),
-				}
-			}(si)
+
+	loadSubtree := func(si int) *subtreeData {
+		if si < 0 || si >= len(evt.Miner0Subtrees) {
+			return nil
 		}
-		cacheWg.Wait()
-		slog.Info("subtree cache loaded",
-			"subtrees", numSubtrees,
-			"estMemoryMB", numSubtrees*64,
-		)
+		ms := evt.Miner0Subtrees[si]
+		if ms == nil || ms.Leaves == nil {
+			return nil
+		}
+		return &subtreeData{Leaves: ms.Leaves, Store: ms.Store}
 	}
+	slog.Info("miner-0 subtrees ready for BUMP assembly",
+		"subtrees", numSubtrees,
+	)
 
 	type deliveryItem struct {
 		token string
@@ -152,16 +142,16 @@ func processBUMPs(
 			for idx := range workCh {
 				tw := work[idx]
 
-				// On-demand proof computation from cached subtree stores.
+				// On-demand proof computation from cached/loaded subtree stores.
 				var proofs []*SubtreeProof
 				subtreeIdxs := evt.TokenSubtreeIdx.SubtreeIndices(tw.token)
 				for _, si := range subtreeIdxs {
 					localIdxs := evt.TokenSubtreeIdx.Get(tw.token, si)
-					if len(localIdxs) == 0 || si >= len(stCache) {
+					if len(localIdxs) == 0 {
 						continue
 					}
-					sc := &stCache[si]
-					if sc.Leaves == nil {
+					sc := loadSubtree(si)
+					if sc == nil {
 						continue
 					}
 					for _, li32 := range localIdxs {

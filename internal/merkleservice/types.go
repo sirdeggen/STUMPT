@@ -44,10 +44,12 @@ type BlockFinalizedEvent struct {
 	// Callbacks maps each token to its callback delivery target.
 	Callbacks map[string]CallbackInfo
 	// TokenSubtreeIdx is the lightweight index of token → (subtreeIdx → []localIdx).
-	// BUMP assembly uses this to find leaf positions, then reloads merkle stores
-	// from disk to compute proofs just-in-time.
+	// BUMP assembly uses this to find leaf positions, then computes proofs JIT.
 	TokenSubtreeIdx *TokenSubtreeIndex
-	// MinerSubStore provides disk-backed access to subtree leaves/stores.
+	// Miner0Subtrees holds the in-memory miner-0 subtree data (leaves + store).
+	// BUMP assembly reads directly from these instead of loading from disk.
+	Miner0Subtrees []*MinerSubtree
+	// MinerSubStore provides disk-backed access to non-miner-0 subtree data.
 	MinerSubStore *diskstore.MinerSubtreeStore
 	// HashesPerSubtree is needed to compute GlobalIdx from (subtreeIdx, localIdx).
 	HashesPerSubtree int
